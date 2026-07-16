@@ -2,6 +2,7 @@
 enabled = true
 config_version = "1.0.0"
 llm_model = "planner"
+lover_name = "麦麦"
 
 [whitelist]
 target_qq = 123456789

@@ -55,7 +55,7 @@ class ScheduleGenerator:
         self._holiday: HolidayService = holiday_service
 
     async def generate_daily_schedule(
-        self, date: str, personality: str = ""
+        self, date: str, personality: str = "", lover_name: str = "麦麦"
     ) -> list[dict[str, Any]]:
         """生成当日日程。
 
@@ -69,6 +69,7 @@ class ScheduleGenerator:
         Args:
             date: 日期字符串（YYYY-MM-DD）。
             personality: 麦麦人设性格文本（从 ctx.config.get 读取）。
+            lover_name: 恋人名称（从 bot.nickname 读取，默认"麦麦"）。
 
         Returns:
             日程节点列表 [{time, activity}, ...]。
@@ -83,7 +84,7 @@ class ScheduleGenerator:
         nodes: list[dict[str, Any]] = []
         try:
             nodes = await self._llm.generate_schedule(
-                date, holiday_info, template_text, personality
+                date, holiday_info, template_text, personality, lover_name
             )
         except Exception:
             # LLM 生成异常，将在下一步使用降级骨架

@@ -53,6 +53,7 @@ class Scheduler:
         self._target_qq: str = ""
         self._stream_id: str = ""
         self._personality: str = ""
+        self._lover_name: str = "麦麦"
         self._last_trigger_time: Optional[datetime] = None
 
     def set_target(self, target_qq: str, stream_id: str) -> None:
@@ -66,7 +67,7 @@ class Scheduler:
         self._stream_id = stream_id
 
     def set_personality(self, personality: str) -> None:
-        """设置麦麦人设性格文本。
+        """设置恋人的人设性格文本。
 
         由 plugin 在 on_load 和 on_config_update 时传入，
         用于日程生成时融入人设性格。
@@ -75,6 +76,18 @@ class Scheduler:
             personality: 人设性格文本。
         """
         self._personality = personality
+
+    def set_lover_name(self, name: str) -> None:
+        """设置恋人名称。
+
+        由 plugin 在 on_load / on_config_update 时传入，
+        替代默认的"麦麦"。读取自 bot.nickname 配置。
+
+        Args:
+            name: 恋人名称。
+        """
+        if name:
+            self._lover_name = name
 
     def get_last_trigger_time(self) -> Optional[datetime]:
         """返回上次成功 proactive trigger 的时间。"""
@@ -101,7 +114,7 @@ class Scheduler:
             self._ctx.logger.info("今日无日程缓存，立即生成")
             try:
                 await self._schedule_gen.generate_daily_schedule(
-                    today_str, self._personality
+                    today_str, self._personality, self._lover_name
                 )
             except Exception as e:
                 self._ctx.logger.error(f"立即生成日程失败: {e}")
@@ -170,7 +183,7 @@ class Scheduler:
             self._ctx.logger.info(f"开始生成 {date_str} 的日程")
             try:
                 await self._schedule_gen.generate_daily_schedule(
-                    date_str, self._personality
+                    date_str, self._personality, self._lover_name
                 )
             except Exception as e:
                 self._ctx.logger.error(f"日程生成失败: {e}")
@@ -364,7 +377,7 @@ class Scheduler:
         activity = str(node.get("activity", ""))
         self._ctx.logger.info(f"B级触发: 日程节点 - {activity}")
         await self._trigger_planner(
-            "activity", f"麦麦现在在{activity}，可以分享"
+            "activity", f"{self._lover_name}现在在{activity}，可以分享"
         )
 
     async def _trigger_daily(self) -> None:
