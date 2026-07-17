@@ -9,6 +9,7 @@ v2.0.0: 移除 generate_speak 方法（主动发言统一走 planner 触发）�
 """
 
 import json
+from datetime import datetime
 from typing import Any
 
 from .config import MaiLoverPluginSettings
@@ -135,8 +136,9 @@ class LLMService:
         Returns:
             日程节点列表 [{time, activity}, ...]，失败返回 []。
         """
+        weekday = "一二三四五六日"[datetime.strptime(date, "%Y-%m-%d").weekday()]
         prompt = SCHEDULE_GENERATION_PROMPT.format(
-            date=date,
+            date=f"{date}（星期{weekday}）",
             holiday_info=holiday_info,
             mai_template=mai_template,
             personality=personality,

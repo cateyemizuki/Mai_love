@@ -163,7 +163,7 @@ class MaiLoverPlugin(MaiBotPlugin):
 
         追加方式（非覆盖）：在已有 extra_prompt 后拼接状态后缀。
         """
-        if not self._schedule_gen:
+        if not self._schedule_gen or not self._holiday_svc:
             return {"action": "continue", "modified_kwargs": kwargs}
 
         # 防护：kwargs 过大时跳过注入（避免触发主程序帧大小限制）
@@ -179,9 +179,15 @@ class MaiLoverPlugin(MaiBotPlugin):
             pass
 
         now = datetime.now()
+        current_date = now.strftime("%Y-%m-%d")
+        weekday = "一二三四五六日"[now.weekday()]
+        holiday_info = await self._holiday_svc.get_holiday_info(current_date)
         current_time = now.strftime("%H:%M")
         activity = self._schedule_gen.get_current_activity(now)
-        suffix = f"\n【麦麦当前状态】现在 {current_time}，麦麦正在{activity}。"
+        suffix = (
+            f"\n【当前日期】今天是 {current_date}（星期{weekday}），{holiday_info}。"
+            f"\n【麦麦当前状态】现在 {current_time}，麦麦正在{activity}。"
+        )
 
         # 追加非覆盖
         kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + suffix
