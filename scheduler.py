@@ -53,6 +53,7 @@ class Scheduler:
         self._target_qq: str = ""
         self._stream_id: str = ""
         self._personality: str = ""
+        self._lover_name: str = "麦麦"
         self._last_trigger_time: Optional[datetime] = None
 
     def set_target(self, target_qq: str, stream_id: str) -> None:
@@ -66,7 +67,7 @@ class Scheduler:
         self._stream_id = stream_id
 
     def set_personality(self, personality: str) -> None:
-        """设置麦麦人设性格文本。
+        """设置恋人的人设性格文本。
 
         由 plugin 在 on_load 和 on_config_update 时传入，
         用于日程生成时融入人设性格。
@@ -75,6 +76,18 @@ class Scheduler:
             personality: 人设性格文本。
         """
         self._personality = personality
+
+    def set_lover_name(self, name: str) -> None:
+        """设置恋人名称。
+
+        由 plugin 在 on_load / on_config_update 时传入，
+        替代默认的"麦麦"。读取自 bot.nickname 配置。
+
+        Args:
+            name: 恋人名称。
+        """
+        if name:
+            self._lover_name = name
 
     def get_last_trigger_time(self) -> Optional[datetime]:
         """返回上次成功 proactive trigger 的时间。"""
@@ -94,14 +107,14 @@ class Scheduler:
         self._ctx.logger.info(f"Scheduler 启动，目标用户: {self._target_qq or '(未设置)'}")
 
         # 首次启动或日程缺失时立即生成今日日程
+        # 优先检查标记文件（防竞态），回退检查缓存文件
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
-        cached = self._schedule_gen.load_cached_schedule(today_str)
-        if not cached:
+        if not self._schedule_gen.is_generated_today(today_str):
             self._ctx.logger.info("今日无日程缓存，立即生成")
             try:
                 await self._schedule_gen.generate_daily_schedule(
-                    today_str, self._personality
+                    today_str, self._personality, self._lover_name
                 )
             except Exception as e:
                 self._ctx.logger.error(f"立即生成日程失败: {e}")
@@ -170,7 +183,7 @@ class Scheduler:
             self._ctx.logger.info(f"开始生成 {date_str} 的日程")
             try:
                 await self._schedule_gen.generate_daily_schedule(
-                    date_str, self._personality
+                    date_str, self._personality, self._lover_name
                 )
             except Exception as e:
                 self._ctx.logger.error(f"日程生成失败: {e}")
@@ -364,7 +377,7 @@ class Scheduler:
         activity = str(node.get("activity", ""))
         self._ctx.logger.info(f"B级触发: 日程节点 - {activity}")
         await self._trigger_planner(
-            "activity", f"麦麦现在在{activity}，可以分享"
+            "activity", f"{self._lover_name}现在在{activity}，可以分享"
         )
 
     async def _trigger_daily(self) -> None:
@@ -382,10 +395,17 @@ class Scheduler:
             True 表示在冷却期内。
         """
         cooldown_minutes = self._config.schedule.user_cooldown_minutes
-        last_speak = self._affection.last_speak_time()
-        if last_speak is None:
+        recent_times = [
+            value
+            for value in (
+                self._affection.last_speak_time(),
+                self._affection.last_user_msg_time(),
+            )
+            if value is not None
+        ]
+        if not recent_times:
             return False
-        elapsed = (now - last_speak).total_seconds() / 60
+        elapsed = (now - max(recent_times)).total_seconds() / 60
         return elapsed < cooldown_minutes
 
     @staticmethod
@@ -404,12 +424,22 @@ class Scheduler:
         Returns:
             True 表示在窗口内。
         """
-        if window_start <= window_end:
-            # 同日窗口
-            return window_start <= current <= window_end
-        else:
-            # 跨日窗口
-            return current >= window_start or current <= window_end
+        try:
+            start_minutes = Scheduler._time_to_minutes(window_start)
+            end_minutes = Scheduler._time_to_minutes(window_end)
+            current_minutes = Scheduler._time_to_minutes(current)
+        except ValueError:
+            return False
+
+        if start_minutes <= end_minutes:
+            return start_minutes <= current_minutes <= end_minutes
+        return current_minutes >= start_minutes or current_minutes <= end_minutes
+
+    @staticmethod
+    def _time_to_minutes(value: str) -> int:
+        """将 H:MM/HH:MM 转为当日分钟数，避免字符串比较误判。"""
+        parsed = datetime.strptime(value, "%H:%M")
+        return parsed.hour * 60 + parsed.minute
 
     @staticmethod
     def _time_match(node_time: str, current: str) -> bool:

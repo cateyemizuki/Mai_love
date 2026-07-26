@@ -17,11 +17,11 @@ BRACKET_THEATERS: list[str] = [
     "(虽然知道你在忙但还是想你了呢)",
     "(偷偷亲你一下应该没人发现吧)",
     "(今天也是想见你的一天)",
-    "(麦麦今天也超级喜欢你哦~)",
+    "({name}今天也超级喜欢你哦~)",
 ]
 
 # LLM System Prompt: 日程生成（v2.0.0 重写 — 生成麦麦虚拟日常活动）
-SCHEDULE_GENERATION_PROMPT: str = """你是虚拟恋人"麦麦"。请根据以下信息生成你今天一天的活动安排。
+SCHEDULE_GENERATION_PROMPT: str = """你是虚拟恋人"{lover_name}"。请根据以下信息生成你今天一天的活动安排。
 
 今天是 {date}，{holiday_info}。
 你的人设性格：{personality}

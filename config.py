@@ -77,6 +77,21 @@ class PluginConfig(PluginConfigBase):
             "order": 1,
         },
     )
+    lover_name: str = Field(
+        default="麦麦",
+        description="恋人的名字。用于日程生成、Tool 描述和括号小剧场中的称呼。留空时回退到主程序 bot.nickname，仍为空则用'麦麦'。",
+        json_schema_extra={
+            "hint": "恋怎么称呼自己。填名字就用该名字；留空则自动跟随主程序 bot 昵称；都为空时默认'麦麦'。",
+            "i18n": _schema_i18n(
+                label_en="Lover Name",
+                label_ja="恋人の名前",
+                hint_en="How she refers to herself. Leave empty to use bot.nickname; falls back to '麦麦' if both are empty.",
+                hint_ja="恋人が自分を呼ぶ名前。空欄なら bot.nickname を使用、どちらも空なら'麦麦'になります。",
+            ),
+            "label": "恋人名称",
+            "order": 0,
+        },
+    )
     enabled: bool = Field(
         default=True,
         description="插件总开关。开启后麦麦才会主动找你说话；关闭则完全静默，不检查日程、不主动发消息。热更新即时生效。",

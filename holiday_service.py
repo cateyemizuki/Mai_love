@@ -38,6 +38,7 @@ class HolidayService:
             config: 插件强类型配置模型。
         """
         self._config: MaiLoverPluginSettings = config
+        self._cache: dict[str, str] = {}
 
     async def get_holiday_info(self, date: str) -> str:
         """获取指定日期的节假日/工作日信息。
@@ -53,17 +54,26 @@ class HolidayService:
         Returns:
             中文描述，如 "工作日" / "周末休息日" / "春节假期"。
         """
+        if date in self._cache:
+            return self._cache[date]
+
         result = await self._call_api(date)
+        info = self._local_judge(date)
         if result is not None:
             holiday_type: int = result.get("type", -1)
             if holiday_type in self.TYPE_MAP:
                 name: str = result.get("name", "")
                 if holiday_type == 2 and name:
-                    return f"{name}假期"
-                return self.TYPE_MAP[holiday_type]
+                    info = f"{name}假期"
+                else:
+                    info = self.TYPE_MAP[holiday_type]
 
-        # API 失败，本地判断
-        return self._local_judge(date)
+        self._cache[date] = info
+        # 简单 LRU：保留最近 7 天，避免长期运行内存增长
+        if len(self._cache) > 7:
+            oldest = min(self._cache.keys())
+            del self._cache[oldest]
+        return info
 
     async def _call_api(self, date: str) -> Optional[dict]:
         """异步调用 timor.tech 节假日 API（httpx）。

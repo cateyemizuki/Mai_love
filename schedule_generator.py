@@ -14,9 +14,12 @@ v2.0.0 变更：
 """
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+_logger = logging.getLogger("MaiLover.ScheduleGenerator")
 
 from .config import MaiLoverPluginSettings
 from .holiday_service import HolidayService
@@ -48,6 +51,7 @@ class ScheduleGenerator:
             holiday_service: 节假日服务。
         """
         self._cache_file: Path = Path(data_dir) / "schedule_cache.json"
+        self._marker_file: Path = Path(data_dir) / ".schedule_generated"
         # 模板文件在插件根目录（data_dir 的上一级），不是 data/ 子目录
         self._template_file: Path = Path(data_dir).parent / "mai_template.json"
         self._config: MaiLoverPluginSettings = config
@@ -55,7 +59,7 @@ class ScheduleGenerator:
         self._holiday: HolidayService = holiday_service
 
     async def generate_daily_schedule(
-        self, date: str, personality: str = ""
+        self, date: str, personality: str = "", lover_name: str = "麦麦"
     ) -> list[dict[str, Any]]:
         """生成当日日程。
 
@@ -69,6 +73,7 @@ class ScheduleGenerator:
         Args:
             date: 日期字符串（YYYY-MM-DD）。
             personality: 麦麦人设性格文本（从 ctx.config.get 读取）。
+            lover_name: 恋人名称（从 bot.nickname 读取，默认"麦麦"）。
 
         Returns:
             日程节点列表 [{time, activity}, ...]。
@@ -83,7 +88,7 @@ class ScheduleGenerator:
         nodes: list[dict[str, Any]] = []
         try:
             nodes = await self._llm.generate_schedule(
-                date, holiday_info, template_text, personality
+                date, holiday_info, template_text, personality, lover_name
             )
         except Exception:
             # LLM 生成异常，将在下一步使用降级骨架
@@ -95,6 +100,9 @@ class ScheduleGenerator:
 
         # 5. 缓存到文件
         self._save_cache(date, nodes)
+
+        # 6. 写入当日已生成标记，防止短时间重启重复触发 LLM 生成
+        self._mark_generated(date)
 
         return nodes
 
@@ -119,6 +127,42 @@ class ScheduleGenerator:
         except (json.JSONDecodeError, IOError):
             pass
         return []
+
+    def is_generated_today(self, date: str) -> bool:
+        """检查当日日程是否已成功生成。
+
+        同时检查标记文件和缓存文件，任一有效即视为已生成。
+        标记文件的引入是为了防止短时间内多次 stop/start
+        导致缓存文件未写回时重复触发 LLM 生成。
+
+        Args:
+            date: 日期字符串（YYYY-MM-DD）。
+
+        Returns:
+            True 表示当日已生成，无需重新生成。
+        """
+        # 优先检查标记文件（比缓存文件更可靠：原子写入，不受覆盖影响）
+        if self._marker_file.exists():
+            try:
+                marker = self._marker_file.read_text(encoding="utf-8").strip()
+                if marker == date:
+                    return True
+            except IOError:
+                pass
+        # 回退检查缓存文件
+        return bool(self.load_cached_schedule(date))
+
+    def _mark_generated(self, date: str) -> None:
+        """写入当日已生成标记。
+
+        Args:
+            date: 日期字符串（YYYY-MM-DD）。
+        """
+        try:
+            self._marker_file.parent.mkdir(parents=True, exist_ok=True)
+            self._marker_file.write_text(date, encoding="utf-8")
+        except IOError as e:
+            _logger.warning(f"写入 .schedule_generated 标记失败: {e}（将回退缓存检查）")
 
     def get_current_activity(self, now: datetime) -> str:
         """查找当前时间点麦麦正在做的活动。

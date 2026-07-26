@@ -9,6 +9,7 @@ v2.0.0: 移除 generate_speak 方法（主动发言统一走 planner 触发）�
 """
 
 import json
+from datetime import datetime
 from typing import Any
 
 from .config import MaiLoverPluginSettings
@@ -120,6 +121,7 @@ class LLMService:
         holiday_info: str,
         mai_template: str,
         personality: str,
+        lover_name: str = "麦麦",
     ) -> list[dict[str, Any]]:
         """生成日程 JSON 数组。
 
@@ -131,15 +133,18 @@ class LLMService:
             holiday_info: 节假日/工作日描述。
             mai_template: 麦麦作息模板格式化文本。
             personality: 麦麦人设性格文本。
+            lover_name: 恋人名称（从 bot.nickname 读取，默认"麦麦"）。
 
         Returns:
             日程节点列表 [{time, activity}, ...]，失败返回 []。
         """
+        weekday = "一二三四五六日"[datetime.strptime(date, "%Y-%m-%d").weekday()]
         prompt = SCHEDULE_GENERATION_PROMPT.format(
-            date=date,
+            date=f"{date}（星期{weekday}）",
             holiday_info=holiday_info,
             mai_template=mai_template,
             personality=personality,
+            lover_name=lover_name,
         )
         response = await self.generate(
             prompt=prompt,

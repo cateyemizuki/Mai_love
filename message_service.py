@@ -29,6 +29,7 @@ class MessageService:
         ctx: Any,
         config: MaiLoverPluginSettings,
         affection_manager: AffectionManager,
+        lover_name: str = "麦麦",
     ) -> None:
         """初始化消息服务。
 
@@ -36,10 +37,12 @@ class MessageService:
             ctx: MaiBot PluginContext 实例。
             config: 插件强类型配置模型。
             affection_manager: 好感度管理器。
+            lover_name: 恋人名称（从 bot.nickname 读取，默认"麦麦"）。
         """
         self._ctx: Any = ctx
         self._config: MaiLoverPluginSettings = config
         self._affection: AffectionManager = affection_manager
+        self._lover_name: str = lover_name
 
     async def send_to_target(self, text: str, stream_id: str, is_proactive: bool = True) -> bool:
         """发送消息给白名单用户。
@@ -108,6 +111,8 @@ class MessageService:
         # 档位 2: 10% 概率追加括号小剧场
         if level == 2 and random.random() < 0.1:
             theater = self._random_suffix(BRACKET_THEATERS)
+            # 用模板占位符填充恋人名称
+            theater = theater.format(name=self._lover_name)
             result = result + theater
 
         return result
