@@ -79,14 +79,14 @@ class PluginConfig(PluginConfigBase):
     )
     lover_name: str = Field(
         default="麦麦",
-        description="麦麦恋人的名字。用于日程生成、Tool 描述和括号小剧场中的称呼。留空表示使用 bot.nickname。",
+        description="恋人的名字。用于日程生成、Tool 描述和括号小剧场中的称呼。留空时回退到主程序 bot.nickname，仍为空则用'麦麦'。",
         json_schema_extra={
-            "hint": "麦麦怎么称呼自己。默认'麦麦'，改成什么她就自称什么。",
+            "hint": "恋怎么称呼自己。填名字就用该名字；留空则自动跟随主程序 bot 昵称；都为空时默认'麦麦'。",
             "i18n": _schema_i18n(
                 label_en="Lover Name",
                 label_ja="恋人の名前",
-                hint_en="How MaiMai refers to herself. Default '麦麦'. Change to whatever you'd like her to call herself.",
-                hint_ja="麦麦が自分を呼ぶ名前です。デフォルトは「麦麦」。自由に変更できます。",
+                hint_en="How she refers to herself. Leave empty to use bot.nickname; falls back to '麦麦' if both are empty.",
+                hint_ja="恋人が自分を呼ぶ名前。空欄なら bot.nickname を使用、どちらも空なら'麦麦'になります。",
             ),
             "label": "恋人名称",
             "order": 0,

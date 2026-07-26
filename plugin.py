@@ -119,6 +119,10 @@ class MaiLoverPlugin(MaiBotPlugin):
             self._scheduler.stop()
         if self._stream_retry_task is not None:
             self._stream_retry_task.cancel()
+            try:
+                await asyncio.wait_for(self._stream_retry_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
             self._stream_retry_task = None
         self.ctx.logger.info("MaiLover 插件已卸载")
 
@@ -666,13 +670,21 @@ class MaiLoverPlugin(MaiBotPlugin):
         )
 
     def _get_lover_name(self) -> str:
-        """获取恋人名称，优先使用插件配置 lover_name，fallback 为'麦麦'。"""
+        """获取恋人名称（三级回退）。
+
+        优先级：
+        1. 插件配置 plugin.lover_name（非空时直接使用）
+        2. 主程序 bot.nickname（配置留空时回退）
+        3. "麦麦"（仍为空时的最终默认值）
+        """
         try:
             configured = self.config.plugin.lover_name
             if configured and configured.strip():
                 return configured.strip()
         except Exception:
             pass
+        if self._cached_nickname:
+            return self._cached_nickname
         return "麦麦"
 
     def _check_target_stream(self, stream_id: str) -> bool:
@@ -755,6 +767,10 @@ class MaiLoverPlugin(MaiBotPlugin):
 
         if self._stream_retry_task is not None:
             self._stream_retry_task.cancel()
+            try:
+                await asyncio.wait_for(self._stream_retry_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
             self._stream_retry_task = None
 
         target_qq = str(self.config.whitelist.target_qq)
