@@ -64,6 +64,7 @@ class MaiLoverPlugin(MaiBotPlugin):
         self._cached_stream_id: str = ""
         self._cached_personality: str = ""
         self._stream_retry_task: Optional[asyncio.Task[Any]] = None
+        self._cached_nickname: str = ""
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -77,24 +78,29 @@ class MaiLoverPlugin(MaiBotPlugin):
             self.ctx.logger.info("MaiLover 插件已禁用（plugin.enabled=false），跳过初始化")
             return
 
+        # 先读主程序配置（人格 + bot.昵称），后续子模块需要用到
+        await self._refresh_bot_config()
+
         self._affection_mgr = AffectionManager(data_dir)
         self._affection_mgr.update_level(self.config.affection.current_level)
         self._memory_mgr = MemoryManager(self._affection_mgr)
         self._llm_svc = LLMService(self.ctx, self.config)
-        self._message_svc = MessageService(self.ctx, self.config, self._affection_mgr)
+        lover_name = self._get_lover_name()
+        self._message_svc = MessageService(
+            self.ctx, self.config, self._affection_mgr, lover_name
+        )
         self._holiday_svc = HolidayService(self.config)
         self._schedule_gen = ScheduleGenerator(
             data_dir, self.config, self._llm_svc, self._holiday_svc
         )
-
-        # 读取主程序人格配置并缓存
-        await self._refresh_personality()
 
         # 创建调度器（v2.0.0: 仅 4 个依赖，不再传 message_svc/llm_svc/memory_mgr）
         self._scheduler = Scheduler(
             self.ctx, self.config, self._affection_mgr, self._schedule_gen,
         )
         self._scheduler.set_personality(self._cached_personality)
+        if lover_name:
+            self._scheduler.set_lover_name(lover_name)
 
         target_qq = str(self.config.whitelist.target_qq)
         if not target_qq or target_qq == "123456789":
@@ -126,9 +132,10 @@ class MaiLoverPlugin(MaiBotPlugin):
         self.ctx.logger.info(f"配置热更新: scope={scope}, version={version}")
 
         if scope == "bot":
-            await self._refresh_personality()
+            await self._refresh_bot_config()
             if self._scheduler is not None:
                 self._scheduler.set_personality(self._cached_personality)
+                self._scheduler.set_lover_name(self._get_lover_name())
             self.ctx.logger.info("主程序人设已同步，无需重启 MaiLover 调度器")
             return None
 
@@ -140,10 +147,6 @@ class MaiLoverPlugin(MaiBotPlugin):
         if self._affection_mgr is not None:
             self._affection_mgr.update_level(self.config.affection.current_level)
             self._affection_mgr.flush()
-
-        # scope="bot" 时刷新人设缓存（主程序 personality 配置变更）
-        if scope == "bot":
-            await self._refresh_personality()
 
         # 同步子模块配置引用
         if self._scheduler is not None:
@@ -225,7 +228,8 @@ class MaiLoverPlugin(MaiBotPlugin):
         now = datetime.now()
         current_time = now.strftime("%H:%M")
         activity = self._schedule_gen.get_current_activity(now)
-        suffix = f"\n【麦麦当前状态】现在 {current_time}，麦麦正在{activity}。"
+        name = self._get_lover_name()
+        suffix = f"\n【{name}当前状态】现在 {current_time}，{name}正在{activity}。"
 
         # 追加非覆盖
         kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + suffix
@@ -264,7 +268,8 @@ class MaiLoverPlugin(MaiBotPlugin):
         if not self._schedule_gen:
             return "日程服务未初始化。"
         activity = self._schedule_gen.get_current_activity(datetime.now())
-        return f"麦麦现在正在{activity}。"
+        name = self._get_lover_name()
+        return f"{name}现在正在{activity}。"
 
     @Tool(
         name="mai_lover_status",
@@ -298,8 +303,9 @@ class MaiLoverPlugin(MaiBotPlugin):
     ) -> str:
         """LLM Tool: 主动发送恋人消息。"""
         stream_id = self._cached_stream_id
+        name = self._get_lover_name()
         if not stream_id:
-            return "麦麦还没有连接到目标用户，请稍后再试。"
+            return f"{name}还没有连接到目标用户，请稍后再试。"
         if not self._message_svc or not self._llm_svc:
             return "消息或 LLM 服务未初始化，无法发送。"
 
@@ -307,7 +313,7 @@ class MaiLoverPlugin(MaiBotPlugin):
             message = await self._llm_svc.generate_or_fallback(
                 prompt="请用温柔恋人的口吻说一句问候或分享一件小事（20-40字）。",
                 fallback="想你了呢~在忙什么呀？",
-                system_prompt="你是一个温柔体贴的虚拟恋人「麦麦」。",
+                system_prompt=f"你是一个温柔体贴的虚拟恋人「{name}」。",
                 temperature=0.8,
             )
 
@@ -356,7 +362,7 @@ class MaiLoverPlugin(MaiBotPlugin):
         p = self.config.probability
         a = self.config.affection
         return (
-            f"⚙️ 麦麦配置: "
+            "⚙️ 麦麦恋人配置: "
             f"巡检间隔 {s.check_interval_minutes}min | "
             f"每日上限 {s.daily_max_speak} 条 | "
             f"冷却 {s.user_cooldown_minutes}min | "
@@ -495,9 +501,10 @@ class MaiLoverPlugin(MaiBotPlugin):
     async def cmd_mai_help(self, **kwargs: Any) -> tuple[bool, str, int]:
         """查看所有可用命令。主动发送帮助文本给用户并拦截消息。"""
         stream_id = str(kwargs.get("stream_id", ""))
+        name = self._get_lover_name()
         help_text = (
             "🐱 麦麦恋人 可用命令:\n"
-            "/mai_status    — 查看麦麦状态（好感度/今日发言/日程摘要）\n"
+            f"/mai_status    — 查看{name}状态（好感度/今日发言/日程摘要）\n"
             "/mai_schedule  — 查看今日完整日程\n"
             "/mai_affection — 调整好感度档位: /mai_affection <0|1|2>\n"
             "/mai_config    — 查看当前插件配置摘要\n"
@@ -519,7 +526,7 @@ class MaiLoverPlugin(MaiBotPlugin):
         p = self.config.probability
         a = self.config.affection
         summary = (
-            f"⚙️ 麦麦配置摘要\n"
+            "⚙️ 麦麦恋人配置摘要\n"
             f"调度: 巡检间隔 {s.check_interval_minutes}min | "
             f"每日上限 {s.daily_max_speak} 条 | "
             f"冷却 {s.user_cooldown_minutes}min | "
@@ -548,7 +555,7 @@ class MaiLoverPlugin(MaiBotPlugin):
             return False, "暂无 stream_id", 2
         try:
             result = await self.ctx.send.text(
-                text="麦麦测试消息~ 发送通道正常 ✅",
+                text=f"{self._get_lover_name()}测试消息~ 发送通道正常 ✅",
                 stream_id=stream_id,
             )
             if result:
@@ -560,7 +567,7 @@ class MaiLoverPlugin(MaiBotPlugin):
     # ── Status / Schedule Reports ──────────────────────────────────────
 
     def _build_status_report(self) -> str:
-        """构造麦麦状态报告文本。"""
+        """构造恋人状态报告文本。"""
         if not self._affection_mgr:
             return "麦麦恋人插件尚未初始化完成。"
 
@@ -609,7 +616,7 @@ class MaiLoverPlugin(MaiBotPlugin):
         if not schedule:
             return f"📅 今日 ({today_str}) 暂无日程缓存。\n可能尚未生成，请等待下次凌晨 {self.config.schedule.generate_hour}:00 自动生成。"
 
-        lines: list[str] = [f"📅 麦麦今日日程 ({today_str})", ""]
+        lines: list[str] = [f"📅 {self._get_lover_name()}今日日程 ({today_str})", ""]
         for node in schedule:
             t = node.get("time", "??:??")
             activity = node.get("activity", "未知")
@@ -619,11 +626,11 @@ class MaiLoverPlugin(MaiBotPlugin):
 
     # ── Internal Helpers ───────────────────────────────────────────────
 
-    async def _refresh_personality(self) -> None:
-        """从主程序配置刷新人设缓存并同步给调度器。
+    async def _refresh_bot_config(self) -> None:
+        """从主程序配置刷新人设和 bot 昵称缓存。
 
-        读取 ctx.config.get("personality.personality") 并缓存到
-        self._cached_personality，同时同步给 scheduler（若已创建）。
+        读取 ctx.config.get("personality.personality") 和
+        ctx.config.get("bot.nickname")，同步给 scheduler（若已创建）。
         """
         try:
             self._cached_personality = await self.ctx.config.get(
@@ -632,11 +639,31 @@ class MaiLoverPlugin(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.warning(f"读取人设配置失败: {e}")
             self._cached_personality = ""
+
+        try:
+            self._cached_nickname = await self.ctx.config.get(
+                "bot.nickname", ""
+            )
+        except Exception as e:
+            self.ctx.logger.warning(f"读取 bot.nickname 失败: {e}")
+            self._cached_nickname = ""
+
         if self._scheduler is not None:
             self._scheduler.set_personality(self._cached_personality)
         self.ctx.logger.debug(
-            f"人设缓存已刷新: {self._cached_personality[:50]}..."
+            f"Bot 配置已刷新: nickname={self._cached_nickname}, "
+            f"personality={self._cached_personality[:50]}..."
         )
+
+    def _get_lover_name(self) -> str:
+        """获取恋人名称，优先使用插件配置 lover_name，fallback 为'麦麦'。"""
+        try:
+            configured = self.config.plugin.lover_name
+            if configured and configured.strip():
+                return configured.strip()
+        except Exception:
+            pass
+        return "麦麦"
 
     def _check_target_stream(self, stream_id: str) -> bool:
         """校验 stream_id 是否属于白名单目标用户。
