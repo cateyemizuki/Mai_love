@@ -25,6 +25,7 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .affection_manager import AffectionManager
 from .config import MaiLoverPluginSettings
+from .constants import AFFECTION_DESCRIPTIONS
 from .holiday_service import HolidayService
 from .llm_service import LLMService
 from .memory_manager import MemoryManager
@@ -229,7 +230,12 @@ class MaiLoverPlugin(MaiBotPlugin):
         current_time = now.strftime("%H:%M")
         activity = self._schedule_gen.get_current_activity(now)
         name = self._get_lover_name()
-        suffix = f"\n【{name}当前状态】现在 {current_time}，{name}正在{activity}。"
+        affection_level = self._affection_mgr.level() if self._affection_mgr else 0
+        affection_desc = AFFECTION_DESCRIPTIONS.get(affection_level, "")
+        suffix = (
+            f"\n【{name}当前状态】现在 {current_time}，{name}正在{activity}。"
+            f"\n【{name}对用户的好感度】档位 {affection_level}（{affection_desc}）"
+        )
 
         # 追加非覆盖
         kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + suffix
