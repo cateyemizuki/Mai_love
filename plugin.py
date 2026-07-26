@@ -108,6 +108,12 @@ class MaiLoverPlugin(MaiBotPlugin):
             self.ctx.logger.warning("target_qq 未配置或为默认值，请修改")
 
         await self._start_scheduler()
+
+        # 预热当天节假日缓存，避免首次 planner 请求阻塞在 API 调用
+        if self._holiday_svc:
+            today = datetime.now().strftime("%Y-%m-%d")
+            asyncio.create_task(self._holiday_svc.get_holiday_info(today))
+
         self.ctx.logger.info("MaiLover 插件加载完成")
 
     async def on_unload(self) -> None:
@@ -802,7 +808,9 @@ class MaiLoverPlugin(MaiBotPlugin):
         """后台重试解析 stream_id。
 
         启动阶段使用短退避重试，避免每次重启后固定失效 5 分钟。
+        达到 MAX_ATTEMPTS 次后停止，避免无限循环。
         """
+        MAX_ATTEMPTS = 60  # 约 1 小时（退避到 60 秒后）
         retry_delays = (5, 10, 20, 30, 60)
         attempt = 0
         while True:
@@ -820,6 +828,16 @@ class MaiLoverPlugin(MaiBotPlugin):
                     return
                 else:
                     attempt += 1
+                    if attempt >= MAX_ATTEMPTS:
+                        self.ctx.logger.warning(
+                            f"stream_id 重试已达 {attempt} 次，停止重试。请检查适配器是否正常连接。"
+                        )
+                        self._stream_retry_task = None
+                        return
+                    if attempt % 10 == 0:
+                        self.ctx.logger.warning(
+                            f"stream_id 已重试 {attempt} 次仍未成功"
+                        )
                     self.ctx.logger.debug(
                         f"stream_id 重试失败，{retry_delays[min(attempt, len(retry_delays) - 1)]} 秒后再次重试"
                     )

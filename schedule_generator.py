@@ -14,9 +14,12 @@ v2.0.0 变更：
 """
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+_logger = logging.getLogger("MaiLover.ScheduleGenerator")
 
 from .config import MaiLoverPluginSettings
 from .holiday_service import HolidayService
@@ -158,8 +161,8 @@ class ScheduleGenerator:
         try:
             self._marker_file.parent.mkdir(parents=True, exist_ok=True)
             self._marker_file.write_text(date, encoding="utf-8")
-        except IOError:
-            pass
+        except IOError as e:
+            _logger.warning(f"写入 .schedule_generated 标记失败: {e}（将回退缓存检查）")
 
     def get_current_activity(self, now: datetime) -> str:
         """查找当前时间点麦麦正在做的活动。

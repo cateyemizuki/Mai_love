@@ -111,9 +111,8 @@ class MessageService:
         # 档位 2: 10% 概率追加括号小剧场
         if level == 2 and random.random() < 0.1:
             theater = self._random_suffix(BRACKET_THEATERS)
-            # 替换小剧场中的默认名称
-            if self._lover_name != "麦麦":
-                theater = theater.replace("麦麦", self._lover_name)
+            # 用模板占位符填充恋人名称
+            theater = theater.format(name=self._lover_name)
             result = result + theater
 
         return result

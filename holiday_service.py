@@ -68,7 +68,11 @@ class HolidayService:
                 else:
                     info = self.TYPE_MAP[holiday_type]
 
-        self._cache = {date: info}
+        self._cache[date] = info
+        # 简单 LRU：保留最近 7 天，避免长期运行内存增长
+        if len(self._cache) > 7:
+            oldest = min(self._cache.keys())
+            del self._cache[oldest]
         return info
 
     async def _call_api(self, date: str) -> Optional[dict]:
