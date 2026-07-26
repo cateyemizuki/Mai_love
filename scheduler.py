@@ -94,10 +94,10 @@ class Scheduler:
         self._ctx.logger.info(f"Scheduler 启动，目标用户: {self._target_qq or '(未设置)'}")
 
         # 首次启动或日程缺失时立即生成今日日程
+        # 优先检查标记文件（防竞态），回退检查缓存文件
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
-        cached = self._schedule_gen.load_cached_schedule(today_str)
-        if not cached:
+        if not self._schedule_gen.is_generated_today(today_str):
             self._ctx.logger.info("今日无日程缓存，立即生成")
             try:
                 await self._schedule_gen.generate_daily_schedule(

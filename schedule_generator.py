@@ -48,6 +48,7 @@ class ScheduleGenerator:
             holiday_service: 节假日服务。
         """
         self._cache_file: Path = Path(data_dir) / "schedule_cache.json"
+        self._marker_file: Path = Path(data_dir) / ".schedule_generated"
         # 模板文件在插件根目录（data_dir 的上一级），不是 data/ 子目录
         self._template_file: Path = Path(data_dir).parent / "mai_template.json"
         self._config: MaiLoverPluginSettings = config
@@ -96,6 +97,9 @@ class ScheduleGenerator:
         # 5. 缓存到文件
         self._save_cache(date, nodes)
 
+        # 6. 写入当日已生成标记，防止短时间重启重复触发 LLM 生成
+        self._mark_generated(date)
+
         return nodes
 
     def load_cached_schedule(self, date: str) -> list[dict[str, Any]]:
@@ -119,6 +123,42 @@ class ScheduleGenerator:
         except (json.JSONDecodeError, IOError):
             pass
         return []
+
+    def is_generated_today(self, date: str) -> bool:
+        """检查当日日程是否已成功生成。
+
+        同时检查标记文件和缓存文件，任一有效即视为已生成。
+        标记文件的引入是为了防止短时间内多次 stop/start
+        导致缓存文件未写回时重复触发 LLM 生成。
+
+        Args:
+            date: 日期字符串（YYYY-MM-DD）。
+
+        Returns:
+            True 表示当日已生成，无需重新生成。
+        """
+        # 优先检查标记文件（比缓存文件更可靠：原子写入，不受覆盖影响）
+        if self._marker_file.exists():
+            try:
+                marker = self._marker_file.read_text(encoding="utf-8").strip()
+                if marker == date:
+                    return True
+            except IOError:
+                pass
+        # 回退检查缓存文件
+        return bool(self.load_cached_schedule(date))
+
+    def _mark_generated(self, date: str) -> None:
+        """写入当日已生成标记。
+
+        Args:
+            date: 日期字符串（YYYY-MM-DD）。
+        """
+        try:
+            self._marker_file.parent.mkdir(parents=True, exist_ok=True)
+            self._marker_file.write_text(date, encoding="utf-8")
+        except IOError:
+            pass
 
     def get_current_activity(self, now: datetime) -> str:
         """查找当前时间点麦麦正在做的活动。
