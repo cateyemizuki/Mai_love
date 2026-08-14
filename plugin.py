@@ -75,6 +75,9 @@ class MaiLoverPlugin(MaiBotPlugin):
         self.ctx.logger.info(f"MaiLover 数据目录: {data_dir}")
         os.makedirs(data_dir, exist_ok=True)
 
+        # 数据迁移：旧式 <plugin>/data/ → ctx.paths.data_dir（SDK 2.6.0+）
+        self._migrate_old_data_dir(data_dir)
+
         if not self.config.plugin.enabled:
             self.ctx.logger.info("MaiLover 插件已禁用（plugin.enabled=false），跳过初始化")
             return
@@ -709,13 +712,49 @@ class MaiLoverPlugin(MaiBotPlugin):
     def _get_data_dir(self) -> str:
         """获取插件数据目录路径。
 
-        数据写入插件目录下的 data/ 子目录，避免插件更新（git pull）时
-        覆盖用户运行时数据（affection_memory.json、schedule_cache.json）。
+        SDK 2.6.0+ 使用框架标准持久化目录 ctx.paths.data_dir，
+        自动回退旧式自建 data 目录以兼容 SDK 2.5.x。
 
         Returns:
             数据目录绝对路径。
         """
+        paths = getattr(self.ctx, "paths", None)
+        if paths is not None:
+            return str(paths.data_dir)
+        # SDK 2.5.x 降级：在插件源码目录下自建 data/
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+    def _migrate_old_data_dir(self, new_data_dir: str) -> None:
+        """将旧式自建 data 目录的数据迁移到框架标准持久化目录。
+
+        SDK 2.6.0+ 推荐使用 ctx.paths.data_dir，旧版本插件在源码目录下
+        自建 data/。首次迁移时自动复制旧数据文件（不覆盖已有文件）。
+
+        Args:
+            new_data_dir: 新数据目录路径（ctx.paths.data_dir 或降级路径）。
+        """
+        old_data_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data"
+        )
+        if not os.path.isdir(old_data_dir):
+            return
+        if os.path.abspath(old_data_dir) == os.path.abspath(new_data_dir):
+            return  # 同一目录（SDK 2.5.x 降级场景），无需迁移
+
+        import shutil
+        migrated = []
+        for fname in os.listdir(old_data_dir):
+            src = os.path.join(old_data_dir, fname)
+            dst = os.path.join(new_data_dir, fname)
+            if os.path.isfile(src) and not os.path.exists(dst):
+                shutil.copy2(src, dst)
+                migrated.append(fname)
+
+        if migrated:
+            self.ctx.logger.info(
+                f"已从旧目录迁移 {len(migrated)} 个文件: "
+                f"{old_data_dir} -> {new_data_dir} ({', '.join(migrated)})"
+            )
 
     async def _resolve_stream_id(self, target_qq: str) -> str:
         """获取目标 QQ 的私聊 stream_id（纯 SDK 路径）。
