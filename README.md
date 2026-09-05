@@ -6,6 +6,32 @@
 
 ---
 
+## Fork 改动说明
+
+> 本仓库 fork 自 [octmicy/Mai_love](https://github.com/octmicy/Mai_love)（基于上游 v2.2.0），在其基础上做了以下改动：
+
+### 1. 新增「使用外部日程」开关（`schedule.use_external_schedule`，默认关闭）
+
+与「麦麦自主规划插件」（`xuqian13.autonomous-planning-plugin-v4`）联动，二选一接管日程来源：
+
+- **开启后**：本插件不再自行生成日程（每日生成循环不启动，`generate_daily_schedule` 内部短路双保险），并**清空已生成的日程缓存**（`schedule_cache.json` 与 `.schedule_generated` 标记）；
+- **日程改读自主规划插件**：巡检时通过跨插件 API `ctx.api.call("xuqian13.autonomous-planning-plugin-v4.get_current_activity")` 拉取当日日程快照，转换为 `{time, activity}` 节点后合并进本地缓存——早安/晚安、日程节点分享、"在干嘛"查询等原有逻辑无需任何改动即可复用；
+- **数据格式兼容层**：自主规划插件是"时间窗口"制（`HH:MM-HH:MM`），本插件是"时间点"制（`HH:MM`），转换规则为窗口起点 → 节点时间、活动名 → 节点活动，跨夜活动（如 23:00-07:00 睡觉）天然正确；
+- **优雅降级**：对方插件未安装/未启用/当日尚未生成日程时按"今日暂无日程"处理，不影响早安、晚安、想念等与日程无关的触发；拉取失败保留旧缓存待下次巡检重试（失败日志 30 分钟节流，不刷屏）；
+- **关闭开关**即恢复本插件自动生成（下次调度器启动时立即补生成当日日程）。
+
+### 2. 其他改动
+
+- 新增 `external_schedule.py`：外部日程源（API 调用、格式转换、TTL 节流）；
+- `schedule_generator.py`：外部模式短路、缓存清理、`refresh_external_schedule` 合并刷新；
+- `scheduler.py`：启动流程按开关分流（清空缓存/跳过生成循环），巡检 `_tick` 前刷新外部日程；
+- `/mai_config` 与 `mai_lover_config` Tool 增加"日程来源"展示；`/mai_schedule` 空日程提示区分外部模式；
+- 新增回归测试 `tests/test_external_schedule.py`；`config.toml` 与 `README.md` 同步更新。
+
+> 上游原有无外部日程开关，所有改动向后兼容：不开启 `use_external_schedule` 时行为与上游完全一致。
+
+---
+
 ## 简介
 
 麦麦恋人是为 MaiBot 设计的私聊专用插件，模拟一个有独立人格、会主动找你聊天的"网恋对象"。
@@ -126,6 +152,7 @@ target_qq = 2335260621  # ← 改成你的 QQ 号
 | `schedule.daily_max_speak` | 5 | 每日主动触发上限 |
 | `schedule.user_cooldown_minutes` | 5 | 用户发言后冷却（分钟） |
 | `schedule.proactive_trigger_enabled` | true | 麦麦会不会主动找你 |
+| `schedule.use_external_schedule` | false | 使用外部日程：读取自主规划插件，本插件清空缓存且不再生成 |
 
 ### 概率设置
 | 参数 | 默认值 | 说明 |
@@ -174,6 +201,15 @@ target_qq = 2335260621  # ← 改成你的 QQ 号
 - `activity` — 麦麦在这个时间正在做什么（自然口语化描述）
 
 每天凌晨插件会读取骨架 + 主程序人设 → LLM 生成完整日程（微调时间 + 加随机活动）→ 缓存到 `schedule_cache.json`。
+
+### 使用外部日程（可选）
+
+如果同时安装了「麦麦自主规划插件」（`xuqian13.autonomous-planning-plugin-v4`），可以把日程来源切换过去：
+
+- `schedule.use_external_schedule = true` 后，本插件**清空已生成的日程缓存**，且**不再生成日程**；
+- 巡检时通过插件 API 读取自主规划插件的当日日程（时间窗口起点 → 节点时间，活动名 → 节点活动），合并进本地缓存供早安晚安/日程节点等逻辑使用；
+- 自主规划插件未安装、未启用或当日尚未生成日程时，本插件按"今日暂无日程"处理，不影响早安/晚安/想念等与日程无关的触发；
+- 关闭该开关后恢复本插件自动生成（下次调度器启动时会立即补生成当日日程）。
 
 ---
 

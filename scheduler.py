@@ -102,29 +102,40 @@ class Scheduler:
 
         日程生成循环不依赖 stream_id，始终启动。
         巡检循环需要 stream_id 才能触发 proactive trigger，无 stream_id 时跳过。
+
+        外部日程模式（use_external_schedule）：清空本地日程缓存、不再启动
+        日程生成循环，日程改由巡检时从自主规划插件拉取（_tick 内刷新）。
         """
         self._stop_event.clear()  # 重置停止标志，支持 stop() 后重新 start()
         self._ctx.logger.info(f"Scheduler 启动，目标用户: {self._target_qq or '(未设置)'}")
 
-        # 首次启动或日程缺失时立即生成今日日程
-        # 优先检查标记文件（防竞态），回退检查缓存文件
+        # 检查是否需要重置每日计数
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
-        if not self._schedule_gen.is_generated_today(today_str):
-            self._ctx.logger.info("今日无日程缓存，立即生成")
-            try:
-                await self._schedule_gen.generate_daily_schedule(
-                    today_str, self._personality, self._lover_name
-                )
-            except Exception as e:
-                self._ctx.logger.error(f"立即生成日程失败: {e}")
-
-        # 检查是否需要重置每日计数（复用 now）
         if self._affection.today_date() != today_str:
             self._affection.reset_daily(today_str)
 
-        # 日程生成循环始终启动（不依赖 stream_id）
-        asyncio.create_task(self._daily_generation_loop())
+        if self._use_external_schedule():
+            # 外部日程模式：清空已有日程，往后不再生成（幂等，重复启动无害）
+            self._schedule_gen.clear_cached_schedule()
+            self._ctx.logger.info(
+                "外部日程模式已开启：本地日程已清空，不再生成日程，"
+                "改为巡检时读取自主规划插件日程"
+            )
+        else:
+            # 首次启动或日程缺失时立即生成今日日程
+            # 优先检查标记文件（防竞态），回退检查缓存文件
+            if not self._schedule_gen.is_generated_today(today_str):
+                self._ctx.logger.info("今日无日程缓存，立即生成")
+                try:
+                    await self._schedule_gen.generate_daily_schedule(
+                        today_str, self._personality, self._lover_name
+                    )
+                except Exception as e:
+                    self._ctx.logger.error(f"立即生成日程失败: {e}")
+
+            # 日程生成循环始终启动（不依赖 stream_id）
+            asyncio.create_task(self._daily_generation_loop())
 
         # 巡检循环需要 stream_id
         if self._stream_id:
@@ -132,6 +143,10 @@ class Scheduler:
             self._ctx.logger.info("巡检循环已启动")
         else:
             self._ctx.logger.warning("无 stream_id，巡检循环未启动（日程生成不受影响）")
+
+    def _use_external_schedule(self) -> bool:
+        """是否使用外部日程（自主规划插件）。配置缺字段时安全回退 False。"""
+        return bool(getattr(self._config.schedule, "use_external_schedule", False))
 
     async def start_patrol(self) -> None:
         """单独启动巡检循环（用于 stream_id 延迟获取后补启）。"""
@@ -146,7 +161,13 @@ class Scheduler:
 
         在 _stop_event 上等待到下一个 generate_hour 时刻，
         然后生成日程、重置每日计数，循环往复。
+
+        外部日程模式下不该被启动；此处再守一道，防止误启动后生成日程。
         """
+        if self._use_external_schedule():
+            self._ctx.logger.debug("外部日程模式，日程生成循环未启动")
+            return
+
         generate_hour = self._config.schedule.generate_hour
 
         while not self._stop_event.is_set():
@@ -297,6 +318,9 @@ class Scheduler:
         # ==============================
         activity_trigger_rate = self._config.probability.activity_trigger_rate
         default_speak_rate = self._config.probability.default_speak_rate
+
+        # 外部日程模式：巡检时刷新（内部带 TTL 节流；非外部模式为 no-op）
+        await self._schedule_gen.refresh_external_schedule(current_date)
 
         schedule = self._schedule_gen.load_cached_schedule(current_date)
         node_matched = False

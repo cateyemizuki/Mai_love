@@ -13,6 +13,8 @@ check_interval_minutes = 10
 daily_max_speak = 5
 user_cooldown_minutes = 30
 proactive_trigger_enabled = true
+# 开启后不再自行生成日程，改为读取「麦麦自主规划插件」的日程，并清空本地日程缓存
+use_external_schedule = false
 
 [probability]
 default_speak_rate = 0.6

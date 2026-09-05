@@ -11,6 +11,12 @@ v2.0.0 变更：
 - 模板文件从 user_template.json 改为 mai_template.json
 - generate_daily_schedule 新增 personality 参数
 - 新增 get_current_activity 公共方法供 Hook/Tool 查询当前活动
+
+外部日程模式（schedule.use_external_schedule）：
+- 开启后本插件不再生成日程，改为读取「麦麦自主规划插件」的日程
+  （经 ExternalScheduleSource 转换为 {time, activity} 节点）
+- 开启时清空本地日程缓存；快照只含"当前 + 未来"活动，
+  refresh_external_schedule 每次把拉取结果合并进缓存，随时间补全全天
 """
 
 import json
@@ -22,6 +28,7 @@ from typing import Any, Optional
 _logger = logging.getLogger("MaiLover.ScheduleGenerator")
 
 from .config import MaiLoverPluginSettings
+from .external_schedule import ExternalScheduleSource
 from .holiday_service import HolidayService
 from .llm_service import LLMService
 
@@ -33,6 +40,7 @@ class ScheduleGenerator:
     同时缓存到 schedule_cache.json 供调度器使用。
 
     v2.0.0: 日程节点格式为 {time, activity}，描述麦麦的虚拟日常活动。
+    外部日程模式下生成路径全部短路，缓存改由 refresh_external_schedule 维护。
     """
 
     def __init__(
@@ -41,6 +49,7 @@ class ScheduleGenerator:
         config: MaiLoverPluginSettings,
         llm_service: LLMService,
         holiday_service: HolidayService,
+        external_source: Optional[ExternalScheduleSource] = None,
     ) -> None:
         """初始化日程生成器。
 
@@ -49,6 +58,7 @@ class ScheduleGenerator:
             config: 插件强类型配置模型（预留给未来功能）。
             llm_service: LLM 服务。
             holiday_service: 节假日服务。
+            external_source: 外部日程源（读取自主规划插件）；None = 不支持外部模式。
         """
         self._cache_file: Path = Path(data_dir) / "schedule_cache.json"
         self._marker_file: Path = Path(data_dir) / ".schedule_generated"
@@ -57,6 +67,61 @@ class ScheduleGenerator:
         self._config: MaiLoverPluginSettings = config
         self._llm: LLMService = llm_service
         self._holiday: HolidayService = holiday_service
+        self._external_source: Optional[ExternalScheduleSource] = external_source
+
+    def is_external_mode(self) -> bool:
+        """是否处于外部日程模式（配置开关 + 外部源可用）。"""
+        return bool(
+            getattr(self._config.schedule, "use_external_schedule", False)
+            and self._external_source is not None
+        )
+
+    def clear_cached_schedule(self) -> None:
+        """清空本地日程缓存与"当日已生成"标记（外部日程模式下使用）。"""
+        removed: list[str] = []
+        for path in (self._cache_file, self._marker_file):
+            try:
+                if path.exists():
+                    path.unlink()
+                    removed.append(path.name)
+            except OSError as e:
+                _logger.warning(f"删除 {path.name} 失败: {e}")
+        if removed:
+            _logger.info(f"已清空本地日程文件: {', '.join(removed)}")
+
+    async def refresh_external_schedule(self, date: str) -> None:
+        """外部日程模式：拉取最新日程并合并进本地缓存。
+
+        快照只含"当前 + 未来"活动，因此采用按 time 合并（union）策略：
+        旧缓存中今天已过时段的节点保留，新的拉取结果覆盖同时间节点。
+        拉取失败时保留现有缓存不动（下次巡检重试）。
+
+        非外部模式下为 no-op，调用方无需判断模式。
+
+        Args:
+            date: 日期字符串（YYYY-MM-DD）。
+        """
+        if not self.is_external_mode() or self._external_source is None:
+            return
+
+        try:
+            nodes = await self._external_source.get_today_nodes(datetime.now())
+        except Exception as e:  # noqa: BLE001
+            # 外部源异常不中断巡检其余逻辑，保留旧缓存等下次重试
+            _logger.warning(f"读取外部日程异常: {e}")
+            return
+        if nodes is None:
+            return  # 拉取失败：保留旧缓存，等待下次巡检重试
+
+        if not nodes:
+            # 对方今日暂无日程（尚未生成或已清空）：保留旧合并结果，不写入
+            return
+
+        merged = {str(n.get("time")): n for n in self.load_cached_schedule(date)}
+        for node in nodes:
+            merged[str(node.get("time"))] = node
+        merged_list = [merged[key] for key in sorted(merged)]
+        self._save_cache(date, merged_list)
 
     async def generate_daily_schedule(
         self, date: str, personality: str = "", lover_name: str = "麦麦"
@@ -70,6 +135,8 @@ class ScheduleGenerator:
         4. LLM 失败 → 使用 mai_template.json 原始骨架
         5. 存入 schedule_cache.json
 
+        外部日程模式下短路：清空本地缓存并返回空列表，绝不生成。
+
         Args:
             date: 日期字符串（YYYY-MM-DD）。
             personality: 麦麦人设性格文本（从 ctx.config.get 读取）。
@@ -78,6 +145,11 @@ class ScheduleGenerator:
         Returns:
             日程节点列表 [{time, activity}, ...]。
         """
+        if self.is_external_mode():
+            # 外部日程模式：清空已有日程且不再生成（双保险，调度器已跳过生成循环）
+            self.clear_cached_schedule()
+            return []
+
         # 1. 获取节假日信息
         holiday_info = await self._holiday.get_holiday_info(date)
 
@@ -135,12 +207,16 @@ class ScheduleGenerator:
         标记文件的引入是为了防止短时间内多次 stop/start
         导致缓存文件未写回时重复触发 LLM 生成。
 
+        外部日程模式下恒返回 True（不生成，"已生成"由外部插件负责）。
+
         Args:
             date: 日期字符串（YYYY-MM-DD）。
 
         Returns:
             True 表示当日已生成，无需重新生成。
         """
+        if self.is_external_mode():
+            return True
         # 优先检查标记文件（比缓存文件更可靠：原子写入，不受覆盖影响）
         if self._marker_file.exists():
             try:

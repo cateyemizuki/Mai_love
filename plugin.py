@@ -26,6 +26,7 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 from .affection_manager import AffectionManager
 from .config import MaiLoverPluginSettings
 from .constants import AFFECTION_DESCRIPTIONS
+from .external_schedule import ExternalScheduleSource
 from .holiday_service import HolidayService
 from .llm_service import LLMService
 from .memory_manager import MemoryManager
@@ -60,6 +61,7 @@ class MaiLoverPlugin(MaiBotPlugin):
         self._llm_svc: Optional[LLMService] = None
         self._message_svc: Optional[MessageService] = None
         self._holiday_svc: Optional[HolidayService] = None
+        self._external_src: Optional[ExternalScheduleSource] = None
         self._schedule_gen: Optional[ScheduleGenerator] = None
         self._scheduler: Optional[Scheduler] = None
         self._cached_stream_id: str = ""
@@ -94,8 +96,12 @@ class MaiLoverPlugin(MaiBotPlugin):
             self.ctx, self.config, self._affection_mgr, lover_name
         )
         self._holiday_svc = HolidayService(self.config)
+        # 外部日程源：use_external_schedule 开启时，ScheduleGenerator 从中读取
+        # 自主规划插件（xuqian13.autonomous-planning-plugin-v4）的日程
+        self._external_src = ExternalScheduleSource(self.ctx)
         self._schedule_gen = ScheduleGenerator(
-            data_dir, self.config, self._llm_svc, self._holiday_svc
+            data_dir, self.config, self._llm_svc, self._holiday_svc,
+            external_source=self._external_src,
         )
 
         # 创建调度器（v2.0.0: 仅 4 个依赖，不再传 message_svc/llm_svc/memory_mgr）
@@ -384,12 +390,14 @@ class MaiLoverPlugin(MaiBotPlugin):
         t = self.config.time_windows
         p = self.config.probability
         a = self.config.affection
+        schedule_source = "外部（自主规划插件）" if s.use_external_schedule else "本插件自动生成"
         return (
             "⚙️ 麦麦恋人配置: "
             f"巡检间隔 {s.check_interval_minutes}min | "
             f"每日上限 {s.daily_max_speak} 条 | "
             f"冷却 {s.user_cooldown_minutes}min | "
             f"触发开关 {'开' if s.proactive_trigger_enabled else '关'} | "
+            f"日程来源 {schedule_source} | "
             f"早安 {t.morning_start}~{t.morning_end} | "
             f"晚安 {t.night_start}~{t.night_end} | "
             f"想念触发 >{t.miss_trigger_hours}h | "
@@ -548,12 +556,15 @@ class MaiLoverPlugin(MaiBotPlugin):
         t = self.config.time_windows
         p = self.config.probability
         a = self.config.affection
+        schedule_source = "外部（自主规划插件）" if s.use_external_schedule else "本插件自动生成"
         summary = (
             "⚙️ 麦麦恋人配置摘要\n"
             f"调度: 巡检间隔 {s.check_interval_minutes}min | "
             f"每日上限 {s.daily_max_speak} 条 | "
             f"冷却 {s.user_cooldown_minutes}min | "
             f"触发开关 {'开启' if s.proactive_trigger_enabled else '关闭'}\n"
+            f"日程来源: {schedule_source} | "
+            f"生成时间: 凌晨 {s.generate_hour}:00（外部模式下不生成）\n"
             f"时间窗口: 早安 {t.morning_start}~{t.morning_end} | "
             f"晚安 {t.night_start}~{t.night_end} | "
             f"想念触发 >{t.miss_trigger_hours}h\n"
@@ -637,6 +648,12 @@ class MaiLoverPlugin(MaiBotPlugin):
 
         schedule = self._schedule_gen.load_cached_schedule(today_str)
         if not schedule:
+            if self._schedule_gen.is_external_mode():
+                return (
+                    f"📅 今日 ({today_str}) 暂无日程。\n"
+                    "已开启「使用外部日程」，正在等待自主规划插件提供日程"
+                    "（请确认其已安装、启用且已生成今日日程）。"
+                )
             return f"📅 今日 ({today_str}) 暂无日程缓存。\n可能尚未生成，请等待下次凌晨 {self.config.schedule.generate_hour}:00 自动生成。"
 
         lines: list[str] = [f"📅 {self._get_lover_name()}今日日程 ({today_str})", ""]
@@ -835,10 +852,16 @@ class MaiLoverPlugin(MaiBotPlugin):
             await self._scheduler.start_patrol()
             self.ctx.logger.info(f"目标用户: {target_qq}, stream_id: {stream_id}")
         else:
-            self.ctx.logger.warning(
-                f"无法获取 stream_id，日程生成已启动但巡检暂不可用。"
-                f"将在后台快速重试解析..."
-            )
+            if self._scheduler._use_external_schedule():
+                self._ctx.logger.warning(
+                    f"无法获取 stream_id，外部日程模式已就绪但巡检暂不可用。"
+                    f"将在后台快速重试解析..."
+                )
+            else:
+                self._ctx.logger.warning(
+                    f"无法获取 stream_id，日程生成已启动但巡检暂不可用。"
+                    f"将在后台快速重试解析..."
+                )
             self._stream_retry_task = asyncio.create_task(
                 self._retry_stream_id(target_qq)
             )

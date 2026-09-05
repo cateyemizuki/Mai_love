@@ -238,6 +238,23 @@ class ScheduleConfig(PluginConfigBase):
             "order": 4,
         },
     )
+    use_external_schedule: bool = Field(
+        default=False,
+        description="使用外部日程：开启后不再自行生成日程，改为通过插件 API 读取「麦麦自主规划插件」"
+                    "（xuqian13.autonomous-planning-plugin-v4）生成的日程；开启时会清空本插件已生成的"
+                    "日程缓存，关闭后恢复自动生成。需要两个插件同时安装。",
+        json_schema_extra={
+            "hint": "开启 = 日程来源改为自主规划插件，本插件清空缓存且不再生成；关闭 = 恢复本插件自动生成。",
+            "i18n": _schema_i18n(
+                label_en="Use External Schedule",
+                label_ja="外部スケジュールを使用",
+                hint_en="Read the daily schedule from the autonomous planning plugin instead of generating one; local schedule cache is cleared and generation stops while enabled.",
+                hint_ja="オンにすると自主計画プラグインのスケジュールを読み込み、ローカルの生成を停止してキャッシュを消去します。",
+            ),
+            "label": "使用外部日程",
+            "order": 5,
+        },
+    )
 
     @field_validator("generate_hour", mode="before")
     @classmethod
