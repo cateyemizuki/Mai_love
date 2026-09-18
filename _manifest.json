@@ -2,8 +2,8 @@
   "manifest_version": 2,
   "id": "maibot-community.mai-love",
   "name": "麦麦恋人",
-  "version": "2.2.0",
-  "description": "私聊专用虚拟恋人插件，会主动找你聊天。基于麦麦的独立日程生活，通过 planner 自主决策什么时候说话、说什么，配合好感度系统调节语气温度",
+  "version": "2.3.1",
+  "description": "私聊专用虚拟恋人插件，会主动找你聊天。基于麦麦的独立日程生活，通过 planner 自主决策什么时候说话、说什么，配合好感度系统调节语气温度。v2.3.1: 补声明 api.call 能力（修复外部日程模式静默失效）；planner 活动注入改为 items 追加（此前写入 extra_prompt 被宿主忽略，注入从未生效）；命令增加白名单鉴权并兼容引用回复匹配；llm_model 合法任务名修正 reply→replyer（旧值自动迁移）；声明 httpx 依赖。",
   "author": {
     "name": "octmicy",
     "url": "https://github.com/octmicy/Mai_love"
@@ -15,14 +15,20 @@
     "documentation": "https://docs.mai-mai.org"
   },
   "host_application": {
-    "min_version": "1.0.0",
+    "min_version": "1.2.3",
     "max_version": "1.99.99"
   },
   "sdk": {
     "min_version": "2.6.0",
     "max_version": "2.99.99"
   },
-  "dependencies": [],
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "httpx",
+      "version_spec": ">=0.24.0"
+    }
+  ],
   "plugin_type": "tool",
   "capabilities": [
     "send.text",
@@ -30,7 +36,8 @@
     "chat.get_private_streams",
     "llm.generate",
     "maisaka.proactive.trigger",
-    "config.get"
+    "config.get",
+    "api.call"
   ],
   "i18n": {
     "default_locale": "zh-CN",
@@ -40,3 +47,4 @@
     ]
   }
 }
+

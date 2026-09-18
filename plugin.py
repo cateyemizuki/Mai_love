@@ -19,6 +19,7 @@ import asyncio
 import os
 from datetime import datetime
 from typing import Any, ClassVar, Iterable, Optional
+from uuid import uuid4
 
 from maibot_sdk import API, Command, HookHandler, MaiBotPlugin, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
@@ -104,9 +105,11 @@ class MaiLoverPlugin(MaiBotPlugin):
             external_source=self._external_src,
         )
 
-        # 创建调度器（v2.0.0: 仅 4 个依赖，不再传 message_svc/llm_svc/memory_mgr）
+        # 创建调度器（v2.0.0: 仅 4 个依赖，不再传 message_svc/memory_mgr；
+        # v2.3.0: 传入 LLM 服务供想念触发前的 LLM 把关使用）
         self._scheduler = Scheduler(
             self.ctx, self.config, self._affection_mgr, self._schedule_gen,
+            llm_service=self._llm_svc,
         )
         self._scheduler.set_personality(self._cached_personality)
         if lover_name:
@@ -169,8 +172,6 @@ class MaiLoverPlugin(MaiBotPlugin):
             self._affection_mgr.flush()
 
         # 同步子模块配置引用
-        if self._scheduler is not None:
-            self._scheduler._config = self.config
         if self._llm_svc is not None:
             self._llm_svc._config = self.config
         if self._message_svc is not None:
@@ -178,9 +179,19 @@ class MaiLoverPlugin(MaiBotPlugin):
         if self._schedule_gen is not None:
             self._schedule_gen._config = self.config
 
-        # 停止旧调度器并重启
+        # 停止旧调度器并重建实例（v2.3.1：复用同一实例时，旧循环若正卡在
+        # tick 中，start() 清除 stop_event 后会与新循环并存，形成双循环竞态）
         if self._scheduler is not None:
             self._scheduler.stop()
+        if self._affection_mgr is not None and self._schedule_gen is not None:
+            self._scheduler = Scheduler(
+                self.ctx, self.config, self._affection_mgr, self._schedule_gen,
+                llm_service=self._llm_svc,
+            )
+            self._scheduler.set_personality(self._cached_personality)
+            lover_name = self._get_lover_name()
+            if lover_name:
+                self._scheduler.set_lover_name(lover_name)
         await self._start_scheduler()
 
         self.ctx.logger.info("配置热更新完成")
@@ -223,46 +234,138 @@ class MaiLoverPlugin(MaiBotPlugin):
 
     @HookHandler("maisaka.planner.before_request")
     async def on_planner_before_request(self, **kwargs: Any) -> dict[str, Any]:
-        """注入麦麦当前活动状态到 planner 的 extra_prompt。
+        """注入麦麦当前活动状态到 planner 上下文。
 
         每次 planner 请求时触发（含用户正常回复和 proactive trigger），
         让麦麦在任何时候都知道自己在做什么。
 
-        追加方式（非覆盖）：在已有 extra_prompt 后拼接状态后缀。
+        注入方式（v2.3.1 修复）：宿主在 planner 请求后只回读 ``items``
+        （1.2.x ContextItem 快照投影）或 ``messages``（更早版本 role/content
+        投影）——往 ``extra_prompt`` 写值会被宿主忽略（那是
+        ``maisaka.replyer.before_request`` 的字段），因此按入参投影构造一条
+        system 消息插入上下文，其余 kwargs 全量回传。
         """
         if not self._schedule_gen or not self._holiday_svc:
             return {"action": "continue", "modified_kwargs": kwargs}
 
-        # 防护：kwargs 过大时跳过注入（避免触发主程序帧大小限制）
+        # 兼容新旧 payload 字段：优先 items，回退 messages
+        items = kwargs.get("items")
+        messages = kwargs.get("messages")
+        if isinstance(items, list) and items:
+            payload_key, payload = "items", items
+        elif isinstance(messages, list) and messages:
+            payload_key, payload = "messages", messages
+        else:
+            return {"action": "continue", "modified_kwargs": kwargs}
+
+        # 防护：payload 过大时跳过注入（避免触发主程序帧大小限制）
         try:
             import json as _json
-            kwargs_size = len(_json.dumps(kwargs, default=str, ensure_ascii=False))
-            if kwargs_size > 1_000_000:  # 1MB
+            payload_size = len(_json.dumps(payload, default=str, ensure_ascii=False))
+            if payload_size > 1_000_000:  # 1MB
                 self.ctx.logger.warning(
-                    f"planner kwargs 过大 ({kwargs_size} bytes)，跳过活动注入"
+                    f"planner payload 过大 ({payload_size} bytes)，跳过活动注入"
                 )
                 return {"action": "continue", "modified_kwargs": kwargs}
         except Exception:
             pass
 
+        suffix = await self._build_activity_suffix()
+        if not suffix:
+            return {"action": "continue", "modified_kwargs": kwargs}
+
+        modified_payload = self._inject_context_message(payload, suffix)
+        modified_kwargs: dict[str, Any] = {**kwargs, payload_key: modified_payload}
+        return {"action": "continue", "modified_kwargs": modified_kwargs}
+
+    async def _build_activity_suffix(self) -> str:
+        """构造当前活动注入文本（日期/节假日/当前活动/好感度）。"""
         now = datetime.now()
         current_date = now.strftime("%Y-%m-%d")
         weekday = "一二三四五六日"[now.weekday()]
         holiday_info = await self._holiday_svc.get_holiday_info(current_date)
         current_time = now.strftime("%H:%M")
-        activity = self._schedule_gen.get_current_activity(now)
         name = self._get_lover_name()
         affection_level = self._affection_mgr.level() if self._affection_mgr else 0
         affection_desc = AFFECTION_DESCRIPTIONS.get(affection_level, "")
-        suffix = (
-            f"\n【当前日期】今天是 {current_date}（星期{weekday}），{holiday_info}。"
-            f"\n【{name}当前状态】现在 {current_time}，{name}正在{activity}。"
-            f"\n【{name}对用户的好感度】档位 {affection_level}（{affection_desc}）"
-        )
 
-        # 追加非覆盖
-        kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + suffix
-        return {"action": "continue", "modified_kwargs": kwargs}
+        suffix = f"\n【当前日期】今天是 {current_date}（星期{weekday}），{holiday_info}。"
+
+        # v2.3.0：无日程时不注入日程状态。外部日程模式下，自主规划插件
+        # 无睡眠时段不生成日程、凌晨日切后当日日程也可能尚未生成——
+        # 此时不再出现"麦麦正在今天还没有安排"这类占位句。
+        activity = self._schedule_gen.find_current_activity(now)
+        if activity:
+            suffix += f"\n【{name}当前状态】现在 {current_time}，{name}正在{activity}。"
+        else:
+            self.ctx.logger.debug("当前无日程（外部日程可能未生成/时段无安排），跳过日程状态注入")
+
+        suffix += f"\n【{name}对用户的好感度】档位 {affection_level}（{affection_desc}）"
+        return suffix
+
+    @staticmethod
+    def _inject_context_message(
+        payload: list[dict[str, Any]], text: str
+    ) -> list[dict[str, Any]]:
+        """把注入文本作为一条 system 消息插入上下文列表。
+
+        兼容两种投影：
+        - ContextItem 快照（MaiBot 1.2.x+，``item_type``/``meta``/``parts``）：
+          构造合法的 SystemMessageItem 快照（item_id 全局唯一），否则宿主
+          反序列化失败会丢弃整个 items 修改；
+        - 旧 role/content 字典：构造 ``{"role": "system", "content": ...}``。
+
+        插入位置：第一条 system 消息之后；没有则插到列表开头。
+        返回浅拷贝副本，不污染调用方列表。
+        """
+        is_snapshot = any(
+            isinstance(m, dict) and isinstance(m.get("item_type"), str) and m.get("item_type")
+            for m in payload
+        )
+        if is_snapshot:
+            logical_turn_id: Optional[str] = None
+            for m in payload:
+                meta = m.get("meta") if isinstance(m, dict) else None
+                if (
+                    isinstance(meta, dict)
+                    and isinstance(meta.get("logical_turn_id"), str)
+                    and meta["logical_turn_id"].strip()
+                ):
+                    logical_turn_id = meta["logical_turn_id"]
+                    break
+            injection: dict[str, Any] = {
+                "item_type": "SystemMessageItem",
+                "meta": {
+                    "item_id": f"mailover-context-{uuid4().hex}",
+                    "logical_turn_id": logical_turn_id,
+                    "timestamp": datetime.now().astimezone().isoformat(),
+                },
+                "parts": [{"type": "text", "text": text}],
+            }
+        else:
+            injection = {"role": "system", "content": text}
+
+        def _role(m: Any) -> str:
+            if not isinstance(m, dict):
+                return ""
+            item_type = m.get("item_type")
+            if isinstance(item_type, str) and item_type:
+                if item_type == "SystemMessageItem":
+                    return "system"
+                return item_type
+            role = m.get("role")
+            return role if isinstance(role, str) else ""
+
+        first_system_idx: Optional[int] = None
+        for idx, m in enumerate(payload):
+            if _role(m) == "system":
+                first_system_idx = idx
+                break
+
+        new_payload = list(payload)
+        insert_at = (first_system_idx + 1) if first_system_idx is not None else 0
+        new_payload.insert(insert_at, injection)
+        return new_payload
 
     @HookHandler("maisaka.replyer.after_response", mode=HookMode.OBSERVE)
     async def on_replyer_after_response(self, **kwargs: Any) -> None:
@@ -391,6 +494,7 @@ class MaiLoverPlugin(MaiBotPlugin):
         p = self.config.probability
         a = self.config.affection
         schedule_source = "外部（自主规划插件）" if s.use_external_schedule else "本插件自动生成"
+        miss_llm = "开" if getattr(t, "miss_llm_check_enabled", False) else "关"
         return (
             "⚙️ 麦麦恋人配置: "
             f"巡检间隔 {s.check_interval_minutes}min | "
@@ -400,7 +504,8 @@ class MaiLoverPlugin(MaiBotPlugin):
             f"日程来源 {schedule_source} | "
             f"早安 {t.morning_start}~{t.morning_end} | "
             f"晚安 {t.night_start}~{t.night_end} | "
-            f"想念触发 >{t.miss_trigger_hours}h | "
+            f"想念触发 {t.miss_trigger_hours_min}~{t.miss_trigger_hours_max}h"
+            f"（LLM把关{miss_llm}） | "
             f"日常概率 {p.default_speak_rate} | "
             f"想念概率 {p.miss_speak_rate} | "
             f"日程节点概率 {p.activity_trigger_rate} | "
@@ -449,9 +554,11 @@ class MaiLoverPlugin(MaiBotPlugin):
 
     # ── Commands (用户手动交互) ────────────────────────────────────────
 
-    @Command(name="/mai_status", pattern=r"^/mai_status\b", description="查看麦麦恋人状态（好感度、发言计数、日程摘要）")
+    @Command(name="/mai_status", pattern=r"(?<!\S)/mai_status\s*$", description="查看麦麦恋人状态（好感度、发言计数、日程摘要）")
     async def cmd_mai_status(self, **kwargs: Any) -> tuple[bool, str, int]:
         """查看麦麦恋人状态。主动发送报告给用户并拦截消息。"""
+        if not self._authorize_command(kwargs):
+            return True, "没有权限", 2
         stream_id = str(kwargs.get("stream_id", ""))
         report = self._build_status_report()
         try:
@@ -461,9 +568,11 @@ class MaiLoverPlugin(MaiBotPlugin):
             self.ctx.logger.error(f"cmd_mai_status 发送失败: {e}")
             return False, f"发送失败: {e}", 2
 
-    @Command(name="/mai_schedule", pattern=r"^/mai_schedule\b", description="查看麦麦今日完整日程")
+    @Command(name="/mai_schedule", pattern=r"(?<!\S)/mai_schedule\s*$", description="查看麦麦今日完整日程")
     async def cmd_mai_schedule(self, **kwargs: Any) -> tuple[bool, str, int]:
         """查看麦麦今日完整日程。主动发送报告给用户并拦截消息。"""
+        if not self._authorize_command(kwargs):
+            return True, "没有权限", 2
         stream_id = str(kwargs.get("stream_id", ""))
         report = self._build_schedule_report()
         try:
@@ -473,13 +582,27 @@ class MaiLoverPlugin(MaiBotPlugin):
             self.ctx.logger.error(f"cmd_mai_schedule 发送失败: {e}")
             return False, f"发送失败: {e}", 2
 
-    @Command(name="/mai_affection", pattern=r"^/mai_affection\b", description="调整好感度档位。用法: /mai_affection <0|1|2>")
+    @Command(
+        name="/mai_affection",
+        pattern=r"(?<!\S)/mai_affection(?:\s+(?P<mai_level>\S+))?\s*$",
+        description="调整好感度档位。用法: /mai_affection <0|1|2>",
+    )
     async def cmd_mai_affection(self, **kwargs: Any) -> tuple[bool, str, int]:
         """调整好感度档位。解析参数、发送确认/用法消息给用户并拦截消息。"""
+        if not self._authorize_command(kwargs):
+            return True, "没有权限", 2
         stream_id = str(kwargs.get("stream_id", ""))
-        raw_message = str(kwargs.get("text", "")).strip()
-        parts = raw_message.split()
-        if len(parts) < 2:
+        # 参数优先取正则命名捕获（兼容"引用+命令"场景下 text 前缀混入其他内容）
+        matched_groups = kwargs.get("matched_groups")
+        level_str = ""
+        if isinstance(matched_groups, dict):
+            level_str = str(matched_groups.get("mai_level", "") or "").strip()
+        if not level_str:
+            raw_message = str(kwargs.get("text", "")).strip()
+            parts = raw_message.split()
+            if len(parts) >= 2 and parts[0].endswith("/mai_affection"):
+                level_str = parts[1]
+        if not level_str:
             current = self._affection_mgr.level() if self._affection_mgr else "?"
             usage = (
                 f"用法: /mai_affection <0|1|2>\n"
@@ -493,7 +616,6 @@ class MaiLoverPlugin(MaiBotPlugin):
             except Exception as e:
                 self.ctx.logger.error(f"cmd_mai_affection 用法发送失败: {e}")
             return False, "参数错误", 2
-        level_str = parts[1]
         try:
             level = int(level_str)
         except (ValueError, TypeError):
@@ -528,9 +650,11 @@ class MaiLoverPlugin(MaiBotPlugin):
             self.ctx.logger.error(f"cmd_mai_affection 确认发送失败: {e}")
             return False, f"发送失败: {e}", 2
 
-    @Command(name="/mai_help", pattern=r"^/mai_help\b", description="查看麦麦恋人所有可用命令")
+    @Command(name="/mai_help", pattern=r"(?<!\S)/mai_help\s*$", description="查看麦麦恋人所有可用命令")
     async def cmd_mai_help(self, **kwargs: Any) -> tuple[bool, str, int]:
         """查看所有可用命令。主动发送帮助文本给用户并拦截消息。"""
+        if not self._authorize_command(kwargs):
+            return True, "没有权限", 2
         stream_id = str(kwargs.get("stream_id", ""))
         name = self._get_lover_name()
         help_text = (
@@ -548,15 +672,18 @@ class MaiLoverPlugin(MaiBotPlugin):
             self.ctx.logger.error(f"cmd_mai_help 发送失败: {e}")
             return False, f"发送失败: {e}", 2
 
-    @Command(name="/mai_config", pattern=r"^/mai_config\b", description="查看麦麦恋人当前配置摘要")
+    @Command(name="/mai_config", pattern=r"(?<!\S)/mai_config\s*$", description="查看麦麦恋人当前配置摘要")
     async def cmd_mai_config(self, **kwargs: Any) -> tuple[bool, str, int]:
         """查看当前配置摘要。主动发送配置信息给用户并拦截消息。"""
+        if not self._authorize_command(kwargs):
+            return True, "没有权限", 2
         stream_id = str(kwargs.get("stream_id", ""))
         s = self.config.schedule
         t = self.config.time_windows
         p = self.config.probability
         a = self.config.affection
         schedule_source = "外部（自主规划插件）" if s.use_external_schedule else "本插件自动生成"
+        miss_llm = "开" if getattr(t, "miss_llm_check_enabled", False) else "关"
         summary = (
             "⚙️ 麦麦恋人配置摘要\n"
             f"调度: 巡检间隔 {s.check_interval_minutes}min | "
@@ -567,7 +694,8 @@ class MaiLoverPlugin(MaiBotPlugin):
             f"生成时间: 凌晨 {s.generate_hour}:00（外部模式下不生成）\n"
             f"时间窗口: 早安 {t.morning_start}~{t.morning_end} | "
             f"晚安 {t.night_start}~{t.night_end} | "
-            f"想念触发 >{t.miss_trigger_hours}h\n"
+            f"想念触发 {t.miss_trigger_hours_min}~{t.miss_trigger_hours_max}h"
+            f"（LLM把关{miss_llm}）\n"
             f"概率: 日常巡检 {p.default_speak_rate} | "
             f"想念 {p.miss_speak_rate} | "
             f"日程节点 {p.activity_trigger_rate}\n"
@@ -581,9 +709,11 @@ class MaiLoverPlugin(MaiBotPlugin):
             self.ctx.logger.error(f"cmd_mai_config 发送失败: {e}")
             return False, f"发送失败: {e}", 2
 
-    @Command(name="/mai_test", pattern=r"^/mai_test\b", description="发送一条测试消息以验证发送通道")
+    @Command(name="/mai_test", pattern=r"(?<!\S)/mai_test\s*$", description="发送一条测试消息以验证发送通道")
     async def cmd_mai_test(self, **kwargs: Any) -> tuple[bool, str, int]:
         """发送测试消息验证发送通道。优先使用 Command 传入的 stream_id。"""
+        if not self._authorize_command(kwargs):
+            return True, "没有权限", 2
         stream_id = str(kwargs.get("stream_id", self._cached_stream_id))
         if not stream_id:
             return False, "暂无 stream_id", 2
@@ -725,6 +855,59 @@ class MaiLoverPlugin(MaiBotPlugin):
         if not stream_id:
             return False
         return stream_id == self._cached_stream_id
+
+    def _is_authorized_command_user(
+        self, user_id: str, is_local_operator: bool = False
+    ) -> bool:
+        """校验命令触发者是否有权使用 /mai_* 命令（v2.3.1 新增）。
+
+        规则：本机控制台操作员天然放行；其余仅白名单 target_qq 本人可用
+        （兼容 ``qq:123456`` 平台前缀写法）。target_qq 为默认值/无效值时
+        一律拒绝（默认拒绝），避免任意会话用户调整好感度或读取配置摘要。
+
+        Args:
+            user_id: 命令触发者用户 ID（宿主注入）。
+            is_local_operator: 是否本机控制台操作员。
+
+        Returns:
+            是否有权限。
+        """
+        if is_local_operator:
+            return True
+
+        target_qq = str(self.config.whitelist.target_qq).strip()
+        if not target_qq or target_qq in ("0", "123456789"):
+            return False
+
+        candidate = str(user_id or "").strip()
+        if not candidate:
+            return False
+        return candidate in (target_qq, f"qq:{target_qq}")
+
+    async def _authorize_command(self, kwargs: dict[str, Any]) -> bool:
+        """命令权限守卫：无权限时发送提示并返回 False（调用方直接拦截返回）。
+
+        Args:
+            kwargs: Command 处理函数收到的 kwargs（含 user_id / stream_id /
+                is_local_operator）。
+
+        Returns:
+            True 表示有权限，可继续执行；False 表示已发送拒绝提示。
+        """
+        if self._is_authorized_command_user(
+            str(kwargs.get("user_id", "") or ""),
+            bool(kwargs.get("is_local_operator", False)),
+        ):
+            return True
+        stream_id = str(kwargs.get("stream_id", "") or "")
+        if stream_id:
+            try:
+                await self.ctx.send.text(
+                    "此命令仅限绑定的恋人用户使用哦~", stream_id
+                )
+            except Exception as e:
+                self.ctx.logger.warning(f"权限提示发送失败: {e}")
+        return False
 
     def _get_data_dir(self) -> str:
         """获取插件数据目录路径。

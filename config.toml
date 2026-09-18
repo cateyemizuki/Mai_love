@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.0.0"
+config_version = "2.3.1"
 llm_model = "planner"
 lover_name = ""  # 留空则使用主程序 bot.nickname，仍为空则用"麦麦"
 
@@ -26,7 +26,16 @@ morning_start = "06:00"
 morning_end = "09:00"
 night_start = "22:00"
 night_end = "23:59"
-miss_trigger_hours = 6
+# 想念触发区间（小时）：每次巡检在区间内随机取阈值，沉默超过阈值才满足时长条件
+# ——沉默越久越容易触发；不足下限绝不触发。旧字段 miss_trigger_hours 已被取代。
+miss_trigger_hours_min = 4.0
+miss_trigger_hours_max = 8.0
+# 触发前让 LLM 以角色身份判断"此刻说想你了是否自然"，不自然则驳回（30 分钟后才重试）
+miss_llm_check_enabled = true
+# 触发时传给 planner 的提示词（占位符：{lover_name} / {hours}）
+miss_reason_prompt = "你已经有 {hours} 个小时没收到用户的消息了，你有点想TA了。可以主动开口问问近况、表达一下想念；但不必强行找话题，如果觉得此刻开口不自然，平淡地打个招呼也可以。"
+# 触发前 LLM 把关提示词（回复 Y 放行 / N 驳回；占位符：{lover_name} / {personality} / {current_time} / {hours} / {activity_context}）
+miss_confirm_prompt = "你是虚拟恋人“{lover_name}”（人设：{personality}）。现在是 {current_time}，你上次收到用户的消息已经是 {hours} 小时前。{activity_context}\n请站在“{lover_name}”的角度判断：此刻主动发一条“想你了 / 关心近况”的消息是否自然、是否体贴？\n- 深夜TA可能睡了、TA可能在忙、或你觉得突兀 → 回复 N\n- 你确实想TA了、此刻开口很自然 → 回复 Y\n只回复一个大写字母：Y 或 N。"
 silence_start = "00:00"
 silence_end = "08:00"
 

@@ -2,11 +2,18 @@
 
 v2.0.0: 主动发言从「插件自行调 LLM + send.text」重构为「统一触发 planner」。
 - S级：早安/晚安检查 → _trigger_morning / _trigger_night
-- A级：想念机制（6 条件全部满足）→ _trigger_missing
+- A级：想念机制（区间阈值 + LLM 把关）→ _trigger_missing
 - B级：日程节点匹配 / 日常巡检 → _trigger_activity / _trigger_daily
 
 所有触发统一走 _trigger_planner → ctx.maisaka.proactive.trigger，
 planner 自主决策是否发言、说什么。
+
+v2.3.0: 想念机制改造——
+- 触发时长从固定阈值改为可配置区间 [min, max]：每次巡检在区间内随机取阈值，
+  沉默越久越容易满足时长条件（平滑爬升而非硬阈值）；
+- 触发前可先经 LLM 以角色身份判断"此刻主动说想你了是否自然"，不自然则驳回
+  （驳回后 30 分钟内不再重复打扰判断），LLM 不可用/无法解析时按驳回处理；
+- 触发 reason 提示词与把关提示词均可在配置中查看和修改。
 """
 
 import asyncio
@@ -16,7 +23,11 @@ from typing import Any, Optional
 
 from .affection_manager import AffectionManager
 from .config import MaiLoverPluginSettings
+from .llm_service import LLMService
 from .schedule_generator import ScheduleGenerator
+
+# 想念被 LLM 驳回后，多久之内不再重复发起把关判断（分钟）
+MISS_REJECT_COOLDOWN_MINUTES = 30.0
 
 
 class Scheduler:
@@ -36,6 +47,7 @@ class Scheduler:
         config: MaiLoverPluginSettings,
         affection_manager: AffectionManager,
         schedule_generator: ScheduleGenerator,
+        llm_service: Optional[LLMService] = None,
     ) -> None:
         """初始化调度器。
 
@@ -44,17 +56,20 @@ class Scheduler:
             config: 插件强类型配置模型。
             affection_manager: 好感度管理器。
             schedule_generator: 日程生成器。
+            llm_service: LLM 服务（想念触发的 LLM 把关用；None = 跳过把关）。
         """
         self._ctx: Any = ctx
         self._config: MaiLoverPluginSettings = config
         self._affection: AffectionManager = affection_manager
         self._schedule_gen: ScheduleGenerator = schedule_generator
+        self._llm: Optional[LLMService] = llm_service
         self._stop_event: asyncio.Event = asyncio.Event()
         self._target_qq: str = ""
         self._stream_id: str = ""
         self._personality: str = ""
         self._lover_name: str = "麦麦"
         self._last_trigger_time: Optional[datetime] = None
+        self._miss_last_reject_at: Optional[datetime] = None
 
     def set_target(self, target_qq: str, stream_id: str) -> None:
         """设置白名单目标用户。
@@ -295,9 +310,10 @@ class Scheduler:
                     await self._trigger_night()
 
         # ==============================
-        # A级：想念机制（6 条件）
+        # A级：想念机制
         # ==============================
-        miss_trigger_hours = self._config.time_windows.miss_trigger_hours
+        # 时长条件：在配置区间 [min, max] 内随机取阈值，沉默时间超过阈值即满足
+        # ——沉默越久越容易触发（平滑爬升），min 之前绝不触发。
         miss_speak_rate = self._config.probability.miss_speak_rate
 
         if not self._affection.miss_sent_today():
@@ -306,12 +322,22 @@ class Scheduler:
             hours_since_last = (
                 (now - last_msg).total_seconds() / 3600 if last_msg else 0
             )
-            if hours_since_last > miss_trigger_hours:
+            if last_msg and hours_since_last > self._sample_miss_threshold():
                 if not self._has_future_schedule(2, now):
                     if self._affection.today_speak_count() < non_night_budget:
                         if not self._is_in_cooldown(now):
                             if random.random() < miss_speak_rate:
-                                await self._trigger_missing()
+                                # LLM 把关：以角色身份判断此刻开口是否自然，
+                                # 驳回则本轮不触发（30 分钟冷却内不重复判断）
+                                if self._miss_llm_check_enabled():
+                                    if not await self._confirm_missing_with_llm(
+                                        hours_since_last, now
+                                    ):
+                                        pass  # 驳回：本轮不触发
+                                    else:
+                                        await self._trigger_missing(hours_since_last)
+                                else:
+                                    await self._trigger_missing(hours_since_last)
 
         # ==============================
         # B级：日程节点匹配 / 日常巡检
@@ -385,12 +411,169 @@ class Scheduler:
         if success:
             self._affection.set_night_sent()
 
-    async def _trigger_missing(self) -> None:
-        """触发想念 planner。"""
-        self._ctx.logger.info("A级触发: 想念机制")
-        success = await self._trigger_planner("missing", "用户很久没理你了")
+    async def _trigger_missing(self, hours_since_last: float) -> None:
+        """触发想念 planner。
+
+        Args:
+            hours_since_last: 距用户最后一条消息的小时数（填入 reason 提示词）。
+        """
+        self._ctx.logger.info(
+            f"A级触发: 想念机制（沉默 {hours_since_last:.1f} 小时）"
+        )
+        reason = self._format_miss_reason(hours_since_last)
+        success = await self._trigger_planner("missing", reason)
         if success:
             self._affection.set_miss_sent()
+
+    # ── 想念机制辅助（v2.3.0）────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_miss_window(low: Any, high: Any) -> tuple[float, float]:
+        """解析并排序想念触发区间，保证 (下限 ≤ 上限)。
+
+        兼容配置缺字段（getattr 默认值）与写反的情况。
+        """
+        try:
+            low_f = float(low)
+        except (TypeError, ValueError):
+            low_f = 4.0
+        try:
+            high_f = float(high)
+        except (TypeError, ValueError):
+            high_f = 8.0
+        return (min(low_f, high_f), max(low_f, high_f))
+
+    def _sample_miss_threshold(self) -> float:
+        """在配置区间内随机取本次巡检的想念触发阈值（小时）。
+
+        每次巡检独立抽样：沉默时间超过阈值才满足时长条件，
+        因此触发概率随沉默时长在 [min, max] 间平滑爬升。
+        """
+        tw = getattr(self._config, "time_windows", None)
+        low, high = self._resolve_miss_window(
+            getattr(tw, "miss_trigger_hours_min", 4.0),
+            getattr(tw, "miss_trigger_hours_max", 8.0),
+        )
+        return random.uniform(low, high)
+
+    def _miss_llm_check_enabled(self) -> bool:
+        """是否启用想念触发前的 LLM 把关（配置缺字段时安全回退 False）。"""
+        if self._llm is None:
+            return False
+        tw = getattr(self._config, "time_windows", None)
+        return bool(getattr(tw, "miss_llm_check_enabled", False))
+
+    def _format_miss_reason(self, hours_since_last: float) -> str:
+        """格式化想念触发的 reason 提示词（模板可在配置中修改）。
+
+        用户改坏占位符或格式化失败时回退为纯文本，保证触发不受影响。
+        """
+        template = getattr(
+            getattr(self._config, "time_windows", None),
+            "miss_reason_prompt",
+            "",
+        )
+        try:
+            return template.format(
+                lover_name=self._lover_name,
+                hours=f"{hours_since_last:.1f}",
+            )
+        except Exception:  # noqa: BLE001（KeyError/IndexError/ValueError 等）
+            return (
+                f"你已经有 {hours_since_last:.1f} 个小时没收到用户的消息了，"
+                "可以考虑主动找TA聊聊，注意自然贴合当前情境。"
+            )
+
+    async def _confirm_missing_with_llm(
+        self, hours_since_last: float, now: datetime
+    ) -> bool:
+        """想念触发前的 LLM 把关：此刻主动表达想念是否自然。
+
+        用配置的 ``miss_confirm_prompt`` 模板构造提示词（含沉默时长、当前
+        时间与当前活动上下文），LLM 回复 Y 才放行；N、无法解析或调用失败
+        一律视为驳回——宁可这轮不打扰，也不硬接话题。
+
+        Args:
+            hours_since_last: 距用户最后一条消息的小时数。
+            now: 当前时间（复用 _tick 的 now）。
+
+        Returns:
+            True = 放行触发；False = 驳回（新鲜驳回时记录驳回时间，
+            之后 30 分钟冷却内的短路判断不再刷新时间戳，保证可恢复）。
+        """
+        # 30 分钟内刚被驳回过：不重复打扰 LLM 判断，直接视为驳回
+        if self._miss_recently_rejected(now):
+            return False
+
+        tw = getattr(self._config, "time_windows", None)
+        template = getattr(tw, "miss_confirm_prompt", "") or ""
+        activity = self._schedule_gen.find_current_activity(now)
+        activity_context = (
+            f"你当前的活动：{activity}。" if activity else "你现在没有安排中的活动。"
+        )
+        try:
+            prompt = template.format(
+                lover_name=self._lover_name,
+                personality=self._personality or "（未配置人设）",
+                current_time=now.strftime("%H:%M"),
+                hours=f"{hours_since_last:.1f}",
+                activity_context=activity_context,
+            )
+        except Exception:  # noqa: BLE001（占位符被改坏时回退默认模板）
+            from .constants import MISS_CONFIRM_PROMPT_DEFAULT
+
+            prompt = MISS_CONFIRM_PROMPT_DEFAULT.format(
+                lover_name=self._lover_name,
+                personality=self._personality or "（未配置人设）",
+                current_time=now.strftime("%H:%M"),
+                hours=f"{hours_since_last:.1f}",
+                activity_context=activity_context,
+            )
+
+        assert self._llm is not None  # _miss_llm_check_enabled 已保证
+        response = await self._llm.generate(
+            prompt=prompt, temperature=0.2, max_tokens=16
+        )
+        verdict = self._parse_missing_confirm(response)
+        if verdict is True:
+            self._ctx.logger.info("想念把关：LLM 判定此刻开口自然，放行触发")
+            return True
+        self._miss_last_reject_at = now  # 只在新鲜驳回时记录，冷却可自然过期
+        self._ctx.logger.info(
+            "想念把关：LLM 驳回本轮触发"
+            f"（response={response!r}，{MISS_REJECT_COOLDOWN_MINUTES:.0f} 分钟后才会再次判断）"
+        )
+        return False
+
+    def _miss_recently_rejected(self, now: datetime) -> bool:
+        """是否处于上次 LLM 驳回后的冷却期。"""
+        if self._miss_last_reject_at is None:
+            return False
+        elapsed = (now - self._miss_last_reject_at).total_seconds() / 60
+        return elapsed < MISS_REJECT_COOLDOWN_MINUTES
+
+    @staticmethod
+    def _parse_missing_confirm(response: str) -> Optional[bool]:
+        """解析 LLM 把关回复：Y=放行，N/空/无法解析=驳回（None 表示无法解析）。
+
+        Returns:
+            True / False / None（无法判定；调用方按驳回处理）。
+        """
+        text = str(response or "").strip()
+        if not text:
+            return None
+        upper = text.upper()
+        for ch in upper:
+            if ch == "Y":
+                return True
+            if ch == "N":
+                return False
+        # 中文字样兜底（LLM 无视"只回一个字母"的要求时）
+        if any(kw in text for kw in ("不", "否", "拒绝", "驳回")):
+            return False
+        if any(kw in text for kw in ("是", "可以", "自然", "合适")):
+            return True
+        return None
 
     async def _trigger_activity(self, node: dict[str, Any]) -> None:
         """触发日程节点活动 planner。

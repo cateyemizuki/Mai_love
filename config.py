@@ -11,6 +11,8 @@ from typing import Any, ClassVar, Dict, Literal, Optional
 from maibot_sdk import Field, PluginConfigBase
 from pydantic import field_validator
 
+from .constants import MISS_CONFIRM_PROMPT_DEFAULT, MISS_REASON_PROMPT_DEFAULT
+
 
 def _schema_i18n(
     *,
@@ -42,7 +44,7 @@ def _schema_i18n(
 # 插件总开关
 # ---------------------------------------------------------------------------
 
-CONFIG_SCHEMA_VERSION = "1.0.0"
+CONFIG_SCHEMA_VERSION = "2.3.1"
 
 
 class PluginConfig(PluginConfigBase):
@@ -62,18 +64,19 @@ class PluginConfig(PluginConfigBase):
             "order": 99,
         },
     )
-    llm_model: Literal["reply", "planner", "utils"] = Field(
+    llm_model: Literal["replyer", "planner", "utils"] = Field(
         default="planner",
-        description="生成日程和回复使用的模型。reply=回复模型，planner=规划模型，utils=工具模型。",
+        description="生成日程和回复使用的模型任务名。replyer=回复模型，planner=规划模型，utils=工具模型。",
         json_schema_extra={
-            "hint": "和 MaiBot 里配的模型名对应。planner 通用性好，reply 回复更自然。",
+            "hint": "对应 MaiBot model_config 的模型任务名（utils/replyer/planner…）。"
+                    "planner 通用性好，replyer 回复更自然。",
             "i18n": _schema_i18n(
-                label_en="LLM Model",
+                label_en="LLM Model Task",
                 label_ja="LLMモデル",
-                hint_en="Matches model names configured in MaiBot. planner is versatile, reply is more natural.",
-                hint_ja="MaiBotで設定したモデル名に対応。plannerは汎用的、replyはより自然な返信。",
+                hint_en="Matches model task names configured in MaiBot. planner is versatile, replyer is more natural.",
+                hint_ja="MaiBotで設定したモデルタスク名に対応。plannerは汎用的、replyerはより自然な返信。",
             ),
-            "label": "LLM 模型",
+            "label": "LLM 模型任务名",
             "order": 1,
         },
     )
@@ -107,6 +110,18 @@ class PluginConfig(PluginConfigBase):
             "order": 0,
         },
     )
+
+    @field_validator("llm_model", mode="before")
+    @classmethod
+    def _normalize_llm_model(cls, value: Any) -> Any:
+        """兼容旧版非法任务名：``reply`` 不是宿主合法任务名（正确为 ``replyer``）。
+
+        旧配置里写了 ``reply`` 的用户升级后自动映射，避免 Literal 校验失败
+        或运行时"未找到名为 reply 的模型配置"导致全部生成静默降级。
+        """
+        if isinstance(value, str) and value.strip().lower() == "reply":
+            return "replyer"
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +368,7 @@ class ProbabilityConfig(PluginConfigBase):
 
 
 class TimeWindowsConfig(PluginConfigBase):
-    """设定早安晚安的时间范围，以及多久不说话算「想你了」。"""
+    """设定早安晚安的时间范围，以及想念机制的触发区间、提示词与 LLM 驳回。"""
 
     __ui_label__: ClassVar[str] = "时间窗口"
     __ui_order__: ClassVar[int] = 4
@@ -430,21 +445,96 @@ class TimeWindowsConfig(PluginConfigBase):
             "placeholder": "23:59",
         },
     )
-    miss_trigger_hours: int = Field(
-        default=6,
-        description="你多久不理麦麦，她就会想你。默认 6 小时——超过 6 小时没说话，她就有概率跑来说想你。",
+    miss_trigger_hours_min: float = Field(
+        default=4.0,
+        description="想念触发区间的下限（小时）：沉默不足这个时间绝不会触发想念。",
         json_schema_extra={
-            "hint": "前提是接下来没有安排其他活动、且今天还没说过想你。",
+            "hint": "小时，可填小数（如 4.5）。配合上限构成触发区间。",
             "i18n": _schema_i18n(
-                label_en="Miss Trigger (hours)",
-                label_ja="「会いたい」トリガー（時間）",
-                hint_en="Only triggers if no other activity is scheduled soon and she hasn't said it today.",
-                hint_ja="近くに他の活動がなく、今日まだ「会いたい」と言っていない場合のみトリガーされます。",
+                label_en="Miss Trigger Min (hours)",
+                label_ja="「会いたい」最小トリガー（時間）",
+                hint_en="Never triggers before this many hours of silence.",
+                hint_ja="この時間未満の沈黙では「会いたい」は発生しません。",
             ),
-            "label": "想念触发时长（小时）",
+            "label": "想念触发下限（小时）",
             "order": 4,
         },
     )
+    miss_trigger_hours_max: float = Field(
+        default=8.0,
+        description="想念触发区间的上限（小时）：沉默超过这个时间后每次巡检都会满足时长条件。"
+                    "区间内每次巡检随机取一个阈值，沉默越久越容易触发，行为不再像定时炸弹。",
+        json_schema_extra={
+            "hint": "小时。上限应 ≥ 下限；写反时自动交换。",
+            "i18n": _schema_i18n(
+                label_en="Miss Trigger Max (hours)",
+                label_ja="「会いたい」最大トリガー（時間）",
+                hint_en="After this many hours the duration condition always passes.",
+                hint_ja="この時間を超えると条件は常に満たされます。",
+            ),
+            "label": "想念触发上限（小时）",
+            "order": 5,
+        },
+    )
+    miss_llm_check_enabled: bool = Field(
+        default=True,
+        description="想念触发前先让 LLM 以角色身份判断此刻主动说'想你了'是否自然，"
+                    "不自然则本轮驳回（30 分钟后才允许再次判断）。关闭则退回纯概率触发。",
+        json_schema_extra={
+            "hint": "开启 = 触发前 LLM 把关，减少'硬接话题'的突兀感；关闭 = 达到条件就按概率直接触发。",
+            "i18n": _schema_i18n(
+                label_en="Miss LLM Check",
+                label_ja="「会いたい」LLM確認",
+                hint_en="Ask the LLM in-character whether reaching out now feels natural; rejected checks are retried after 30 minutes.",
+                hint_ja="発話前に LLM が自然かどうかを判断します。却下された場合は 30 分後に再試行します。",
+            ),
+            "label": "想念触发前 LLM 把关",
+            "order": 6,
+        },
+    )
+    miss_reason_prompt: str = Field(
+        default=MISS_REASON_PROMPT_DEFAULT,
+        description="想念触发时传给 planner 的提示文本（reason）。可用占位符：{lover_name}、{hours}。",
+        json_schema_extra={
+            "hint": "触发后 planner 据此自主发挥；占位符 {hours}=沉默小时数，{lover_name}=恋人名。",
+            "i18n": _schema_i18n(
+                label_en="Miss Reason Prompt",
+                label_ja="「会いたい」理由プロンプト",
+                hint_en="Sent to the planner when a miss trigger fires. Placeholders: {lover_name}, {hours}.",
+                hint_ja="トリガー時に planner へ渡すテキスト。プレースホルダー: {lover_name}, {hours}。",
+            ),
+            "label": "想念触发提示词（触发后）",
+            "order": 7,
+            "rows": 3,
+        },
+    )
+    miss_confirm_prompt: str = Field(
+        default=MISS_CONFIRM_PROMPT_DEFAULT,
+        description="LLM 把关用的提示词模板（回复 Y 才触发、N 驳回）。可用占位符："
+                    "{lover_name}、{personality}、{current_time}、{hours}、{activity_context}。",
+        json_schema_extra={
+            "hint": "{activity_context}=当前活动（无日程时为空串）；改完保存即热更新生效。",
+            "i18n": _schema_i18n(
+                label_en="Miss Confirm Prompt",
+                label_ja="「会いたい」確認プロンプト",
+                hint_en="Gate prompt template; LLM must answer Y to proceed. Placeholders: {lover_name}, {personality}, {current_time}, {hours}, {activity_context}.",
+                hint_ja="LLM が Y と答えたときのみ発火。プレースホルダー: {lover_name} など。",
+            ),
+            "label": "想念把关提示词（触发前）",
+            "order": 8,
+            "rows": 5,
+        },
+    )
+    @field_validator("miss_trigger_hours_min", mode="before")
+    @classmethod
+    def _normalize_miss_hours_min(cls, value: Any) -> float:
+        return _normalize_float_in_range(value, 4.0, 0.5, 72.0)
+
+    @field_validator("miss_trigger_hours_max", mode="before")
+    @classmethod
+    def _normalize_miss_hours_max(cls, value: Any) -> float:
+        return _normalize_float_in_range(value, 8.0, 0.5, 72.0)
+
     silence_start: str = Field(
         default="00:00",
         description="静默时段开始。在这个时间之后麦麦不主动找你说话，让你好好休息。格式 HH:MM。",
@@ -548,4 +638,18 @@ def _normalize_int_in_range(value: Any, default: int, low: int, high: int) -> in
         value = int(value)
     if isinstance(value, int):
         return max(low, min(high, value))
+    return default
+
+
+def _normalize_float_in_range(
+    value: Any, default: float, low: float, high: float
+) -> float:
+    """规范化浮点数并限制在 [low, high] 范围内（兼容整数字符串输入）。"""
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except (ValueError, TypeError):
+            return default
+    if isinstance(value, (int, float)):
+        return max(low, min(high, float(value)))
     return default

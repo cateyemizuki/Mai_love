@@ -240,26 +240,31 @@ class ScheduleGenerator:
         except IOError as e:
             _logger.warning(f"写入 .schedule_generated 标记失败: {e}（将回退缓存检查）")
 
-    def get_current_activity(self, now: datetime) -> str:
-        """查找当前时间点麦麦正在做的活动。
+    def find_current_activity(self, now: datetime) -> Optional[str]:
+        """查找当前时间点麦麦正在做的活动（可区分"无日程"）。
 
         查找逻辑：
         1. 加载今日日程缓存
         2. 在所有 time <= 当前时间的节点中，取最后一个的 activity
-        3. 无日程或无匹配节点 → 返回 "今天还没有安排"
+        3. 无日程缓存 / 没有已开始的节点 → 返回 None
 
         兼容旧格式节点：若无 activity 字段则跳过该节点。
+
+        v2.3.0: 与 :meth:`get_current_activity` 的区别在于"无日程"返回 None
+        而非占位文案——外部日程模式（自主规划插件 v4.7 起无睡眠时段不生成
+        日程）与凌晨日切后（对方当日日程尚未生成）都不应再注入日程状态，
+        由调用方决定跳过注入。
 
         Args:
             now: 当前时间。
 
         Returns:
-            活动描述字符串。
+            活动描述字符串；无日程 / 无已开始节点时返回 None。
         """
         today_str = now.strftime("%Y-%m-%d")
         schedule = self.load_cached_schedule(today_str)
         if not schedule:
-            return "今天还没有安排"
+            return None
 
         now_minutes = now.hour * 60 + now.minute
         current_activity: Optional[str] = None
@@ -280,8 +285,24 @@ class ScheduleGenerator:
                 # 节点时间 > 当前时间 → 后续节点还没开始，停止遍历
                 break
 
-        if current_activity:
-            return current_activity
+        return current_activity
+
+    def get_current_activity(self, now: datetime) -> str:
+        """查找当前时间点麦麦正在做的活动。
+
+        无日程或无匹配节点时返回占位文案 "今天还没有安排"。
+        需要区分"无日程"的场景（如 planner 注入）请改用
+        :meth:`find_current_activity`。
+
+        Args:
+            now: 当前时间。
+
+        Returns:
+            活动描述字符串。
+        """
+        activity = self.find_current_activity(now)
+        if activity:
+            return activity
         return "今天还没有安排"
 
     def _read_template(self) -> str:

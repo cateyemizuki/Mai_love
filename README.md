@@ -4,6 +4,10 @@
 
 > 麦麦有自己的生活 · 主动找你聊天 · 好感度调节温度
 
+> **版本要求**：MaiBot ≥ v1.2.3，maibot-plugin-sdk ≥ 2.6.0。
+> 本插件依赖 `maisaka.proactive.trigger` 能力与 `maisaka.*` Hook，其 payload
+> 契约以 1.2.3 为首个文档化基线，更低版本上这些功能会静默失效。
+
 ---
 
 ## Fork 改动说明
@@ -18,6 +22,7 @@
 - **日程改读自主规划插件**：巡检时通过跨插件 API `ctx.api.call("xuqian13.autonomous-planning-plugin-v4.get_current_activity")` 拉取当日日程快照，转换为 `{time, activity}` 节点后合并进本地缓存——早安/晚安、日程节点分享、"在干嘛"查询等原有逻辑无需任何改动即可复用；
 - **数据格式兼容层**：自主规划插件是"时间窗口"制（`HH:MM-HH:MM`），本插件是"时间点"制（`HH:MM`），转换规则为窗口起点 → 节点时间、活动名 → 节点活动，跨夜活动（如 23:00-07:00 睡觉）天然正确；
 - **优雅降级**：对方插件未安装/未启用/当日尚未生成日程时按"今日暂无日程"处理，不影响早安、晚安、想念等与日程无关的触发；拉取失败保留旧缓存待下次巡检重试（失败日志 30 分钟节流，不刷屏）；
+- **无日程不注入**（v2.3.0）：对方无日程返回时（自主规划插件 v4.7 起无睡眠时段不生成日程、凌晨日切后当日日程尚未生成），planner 注入**跳过日程状态行**，不再出现"麦麦正在今天还没有安排"这类占位句；日期/好感度注入不受影响；
 - **关闭开关**即恢复本插件自动生成（下次调度器启动时立即补生成当日日程）。
 
 ### 2. 其他改动
@@ -26,7 +31,27 @@
 - `schedule_generator.py`：外部模式短路、缓存清理、`refresh_external_schedule` 合并刷新；
 - `scheduler.py`：启动流程按开关分流（清空缓存/跳过生成循环），巡检 `_tick` 前刷新外部日程；
 - `/mai_config` 与 `mai_lover_config` Tool 增加"日程来源"展示；`/mai_schedule` 空日程提示区分外部模式；
-- 新增回归测试 `tests/test_external_schedule.py`；`config.toml` 与 `README.md` 同步更新。
+- 离线回归测试仅保留在本地开发环境（不随插件发布）；`config.toml` 与 `README.md` 同步更新；
+- **想念机制改造**（v2.3.0）：触发时长改为可配置区间 `miss_trigger_hours_min/max`（每次巡检区间内随机取阈值，沉默越久越容易触发）；触发前可经 LLM 把关（`miss_llm_check_enabled`，驳回 30 分钟冷却）；把关提示词与触发提示词均可在配置中查看修改（见下文「想念触发提示词」）；无日程时不注入日程状态行。
+
+### 3. v2.3.1 规范与安全整改
+
+- **补声明 `api.call` 能力**：此前 manifest 未声明 `api.call`，开启外部日程后
+  调用会被宿主以 `E_CAPABILITY_DENIED` 拒绝并静默吞掉，外部日程模式从未真正生效；
+- **planner 活动注入修复**：宿主在 `maisaka.planner.before_request` 后只回读
+  `items`/`messages`，此前写入 `extra_prompt` 会被忽略（那是 replyer Hook 的
+  字段）——现改为向上下文追加一条 SystemMessageItem（快照投影）或 system
+  消息（旧投影），日期/节假日/当前活动/好感度注入自此真正生效；
+- **命令鉴权**：`/mai_*` 命令仅限白名单 `target_qq` 本人（及本机控制台）使用，
+  `target_qq` 为默认值/无效值时一律拒绝（默认拒绝）；
+- **命令正则兼容引用回复**：`^/mai_xxx` 的 `^` 锚点在"引用+命令"场景失配，
+  改为 `(?<!\S)/mai_xxx` 负向前瞻 + 文末锚定写法；
+- **`llm_model` 任务名修正**：`reply` 不是宿主合法任务名（应为 `replyer`），
+  选项与旧配置值自动迁移，避免选中后所有生成静默降级；
+- **依赖与版本**：manifest 声明 `httpx` 依赖；`config_version` 与 manifest
+  版本同步（2.3.1）；`min_version` 抬高至 1.2.3；
+- **调度器热更新竞态修复**：配置热更新时重建 Scheduler 实例，避免复用同一
+  `stop_event` 造成新旧巡检循环并存。
 
 > 上游原有无外部日程开关，所有改动向后兼容：不开启 `use_external_schedule` 时行为与上游完全一致。
 
@@ -56,7 +81,9 @@
 - **planner 状态注入** — 每次 planner 思考时都能看到"麦麦现在在干嘛"，让回复自然带上当前状态
 - **主动聊天** — scheduler 定时提醒 planner"可以考虑说话了"，planner 自主决定发不发
 - **早晚安仪式** — 早安/晚安时间窗触发 planner，麦麦主动跟你说早/晚安
-- **想念机制** — 你太久没理她，麦麦会跑来说想你（每天最多 1 次）
+- **想念机制** — 你太久没理她，麦麦会跑来说想你：触发时长是**可配置区间**
+  （沉默越久越容易触发），触发前还可让 **LLM 以角色身份把关**，此刻开口
+  不自然就驳回，不再"被代码推着硬接话题"（每天最多 1 次）
 - **"在干嘛"查询** — 你问"在干嘛"时，planner 调用 Tool 查麦麦当前活动，自然回答
 - **静默时段** — 配置睡觉时间，那段时间麦麦完全安静
 - **好感度系统** — 3 档位影响语气温度（熟悉/亲密/热恋）
@@ -98,6 +125,9 @@ target_qq = 2335260621  # ← 改成你的 QQ 号
 ## 交互方式
 
 ### 用户命令
+
+> v2.3.1 起命令增加鉴权：仅白名单 `target_qq` 本人（及本机控制台）可使用，
+> 其他用户触发会被拒绝并拦截。
 
 | 命令 | 功能 |
 |------|------|
@@ -168,9 +198,41 @@ target_qq = 2335260621  # ← 改成你的 QQ 号
 | `time_windows.morning_end` | 09:00 | 早安窗口结束 |
 | `time_windows.night_start` | 22:00 | 晚安窗口开始 |
 | `time_windows.night_end` | 23:59 | 晚安窗口结束 |
-| `time_windows.miss_trigger_hours` | 6 | 多久不理麦麦她会想你（小时） |
+| `time_windows.miss_trigger_hours_min` | 4.0 | 想念触发区间下限（小时）：沉默不足绝不触发 |
+| `time_windows.miss_trigger_hours_max` | 8.0 | 想念触发区间上限（小时）：沉默超过后时长条件必满足 |
+| `time_windows.miss_llm_check_enabled` | true | 想念触发前 LLM 把关（不自然则驳回，30 分钟后重试） |
+| `time_windows.miss_reason_prompt` | （见下） | 想念触发时传给 planner 的提示词 |
+| `time_windows.miss_confirm_prompt` | （见下） | LLM 把关提示词模板（Y 放行 / N 驳回） |
 | `time_windows.silence_start` | 00:00 | 静默时段开始（睡觉不打扰） |
 | `time_windows.silence_end` | 08:00 | 静默时段结束 |
+
+### 想念触发提示词
+
+想念机制涉及两条提示词，均可在 WebUI / `config.toml` 中查看和修改：
+
+**1. 把关提示词**（`miss_confirm_prompt`，触发前）：沉默时长满足区间条件且通过
+概率掷点后，先用这条提示词让 LLM 扮演麦麦判断"此刻主动说想你了是否自然"，
+回复 `Y` 才真正触发，`N`（或无法解析）则本轮驳回，30 分钟内不再重复判断：
+
+```text
+你是虚拟恋人"{lover_name}"（人设：{personality}）。现在是 {current_time}，你上次收到用户的消息已经是 {hours} 小时前。{activity_context}
+请站在"{lover_name}"的角度判断：此刻主动发一条"想你了 / 关心近况"的消息是否自然、是否体贴？
+- 深夜TA可能睡了、TA可能在忙、或你觉得突兀 → 回复 N
+- 你确实想TA了、此刻开口很自然 → 回复 Y
+只回复一个大写字母：Y 或 N。
+```
+
+**2. 触发提示词**（`miss_reason_prompt`，触发后）：把关通过、真正触发时传给
+planner 的 `reason`，planner 据此自主决定说什么（不再是被代码写死的
+"用户很久没理你了"）：
+
+```text
+你已经有 {hours} 个小时没收到用户的消息了，你有点想TA了。可以主动开口问问近况、表达一下想念；但不必强行找话题，如果觉得此刻开口不自然，平淡地打个招呼也可以。
+```
+
+可用占位符：`{lover_name}` 恋人名、`{hours}` 沉默小时数、`{personality}` 人设、
+`{current_time}` 当前时间、`{activity_context}` 当前活动上下文（无日程时为
+"你现在没有安排中的活动。"）。
 
 ### 好感度
 | 参数 | 默认值 | 说明 |
@@ -252,13 +314,6 @@ mai_lover/
 ├── scheduler.py           # 调度引擎（触发 planner）
 ├── mai_template.json      # 麦麦作息骨架
 ├── data/                  # 运行时数据目录（好感度/日程缓存，自动生成）
-├── tests/                 # 测试
-│   ├── test_refactor.py
-│   ├── test_cmd_fix.py
-│   └── test_bugfixes.py
-├── docs/                  # 设计文档
-│   ├── refactor-prd.md
-│   └── refactor-design.md
 └── README.md              # 本文件
 ```
 
