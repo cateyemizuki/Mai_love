@@ -64,6 +64,14 @@ MISS_CONFIRM_PROMPT_DEFAULT: str = (
     "只回复一个大写字母：Y 或 N。"
 )
 
+# 3) 恋人电脑屏幕截图的视觉理解提示词（v2.4.0，随截图发给 vlm 任务；
+#    可在配置 [cateye] describe_prompt 中修改）
+SCREEN_DESCRIBE_PROMPT_DEFAULT: str = (
+    "这是你的恋人电脑屏幕的截图。请用一句话（不超过 40 字、口语化）描述"
+    "TA现在可能在干什么（比如在打游戏 / 写代码 / 看视频 / 挂机离开）。\n"
+    "如果截图上看不出具体内容，就回答：屏幕上看不出具体内容。"
+)
+
 # 节假日 API 降级：周一~周五为工作日
 HOLIDAY_FALLBACK_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}
 

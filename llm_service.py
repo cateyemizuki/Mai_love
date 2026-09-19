@@ -6,14 +6,18 @@
 3. 提供便捷的 generate_or_fallback、generate_schedule 方法
 
 v2.0.0: 移除 generate_speak 方法（主动发言统一走 planner 触发）。
+v2.4.0: generate 增加 event 参数——每次调用经 LLMCallLogger 记录
+（事件来源/时间/回复内容），供 /mai_llm_log 查看；新增 describe_image
+用视觉模型解读截图（cateye 恋人电脑联动）。
 """
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from .config import MaiLoverPluginSettings
 from .constants import SCHEDULE_GENERATION_PROMPT
+from .llm_logger import LLMCallLogger
 
 
 class LLMService:
@@ -23,15 +27,22 @@ class LLMService:
     专用方法，均带降级处理。
     """
 
-    def __init__(self, ctx: Any, config: MaiLoverPluginSettings) -> None:
+    def __init__(
+        self,
+        ctx: Any,
+        config: MaiLoverPluginSettings,
+        call_logger: Optional[LLMCallLogger] = None,
+    ) -> None:
         """初始化 LLM 服务。
 
         Args:
             ctx: MaiBot PluginContext 实例。
             config: 插件强类型配置模型。
+            call_logger: LLM 调用日志记录器（None = 不记录）。
         """
         self._ctx: Any = ctx
         self._config: MaiLoverPluginSettings = config
+        self._call_logger: Optional[LLMCallLogger] = call_logger
 
     @property
     def _model(self) -> str:
@@ -42,12 +53,29 @@ class LLMService:
         """
         return self._config.plugin.llm_model
 
+    def _record(
+        self,
+        event: str,
+        model: str,
+        success: bool,
+        response: str,
+        error: str = "",
+    ) -> None:
+        """把一次调用写入日志（未配置记录器时 no-op，异常静默）。"""
+        if self._call_logger is None:
+            return
+        try:
+            self._call_logger.record(event, model, success, response, error)
+        except Exception:  # noqa: BLE001 —— 日志绝不影响正常流程
+            pass
+
     async def generate(
         self,
         prompt: str,
         system_prompt: str = "",
         temperature: float = 0.7,
         max_tokens: int = 512,
+        event: str = "unspecified",
     ) -> str:
         """调用 LLM 生成文本，失败返回空字符串。
 
@@ -59,6 +87,7 @@ class LLMService:
             system_prompt: 系统提示词。
             temperature: 采样温度。
             max_tokens: 最大生成 token 数。
+            event: 事件来源标注（写入调用日志，如 ``miss_confirm``）。
 
         Returns:
             生成的文本，失败返回空字符串。
@@ -78,14 +107,73 @@ class LLMService:
                 max_tokens=max_tokens,
             )
             if result.get("success") and result.get("response"):
-                return str(result["response"]).strip()
-            self._ctx.logger.warning(
-                f"LLM 生成失败: {result.get('error', '未知错误')}"
-            )
+                response = str(result["response"]).strip()
+                self._record(event, self._model, True, response)
+                return response
+            error = str(result.get("error", "未知错误"))
+            self._ctx.logger.warning(f"LLM 生成失败: {error}")
+            self._record(event, self._model, False, "", error)
             return ""
         except Exception as e:
             self._ctx.logger.error(f"LLM 调用异常: {e}")
+            self._record(event, self._model, False, "", str(e))
             return ""
+
+    async def describe_image(
+        self,
+        image_b64: str,
+        prompt: str,
+        event: str = "cateye_screen_describe",
+    ) -> str:
+        """用视觉模型解读一张图片，返回一句话描述；失败返回空字符串。
+
+        使用配置 ``[cateye] vlm_task`` 指定的视觉任务（默认 ``vlm``）。
+        图片以多模态 content 段（Data URL 形式）传入——宿主
+        ``llm.generate`` 已确认支持该格式（见 SDK 文档 §8.3「图片输入」，
+        实现 `src/services/llm_service.py` `_append_image_content`）；
+        若视觉任务未配置或片段被拒，返回失败，调用方据此降级。
+
+        Args:
+            image_b64: 图片 base64（PNG）。
+            prompt: 视觉理解提示词。
+            event: 事件来源标注（写入调用日志）。
+
+        Returns:
+            描述文本，失败返回空字符串。
+        """
+        cateye_cfg = getattr(self._config, "cateye", None)
+        vlm_task = str(getattr(cateye_cfg, "vlm_task", "vlm") or "vlm")
+        message: list[dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    },
+                ],
+            }
+        ]
+        try:
+            result: dict[str, Any] = await self._ctx.llm.generate(
+                prompt=message,
+                model=vlm_task,
+                temperature=0.3,
+                max_tokens=128,
+            )
+        except Exception as e:
+            self._ctx.logger.error(f"视觉模型调用异常: {e}")
+            self._record(event, vlm_task, False, "", str(e))
+            return ""
+        if result.get("success") and result.get("response"):
+            response = str(result["response"]).strip()
+            self._record(event, vlm_task, True, response)
+            return response
+        error = str(result.get("error", "未知错误"))
+        self._ctx.logger.warning(f"视觉模型生成失败: {error}")
+        self._record(event, vlm_task, False, "", error)
+        return ""
 
     async def generate_or_fallback(
         self,
@@ -93,6 +181,7 @@ class LLMService:
         fallback: str,
         system_prompt: str = "",
         temperature: float = 0.7,
+        event: str = "unspecified",
     ) -> str:
         """LLM 调用，失败时返回预设降级文案。
 
@@ -101,6 +190,7 @@ class LLMService:
             fallback: 降级文案。
             system_prompt: 系统提示词。
             temperature: 采样温度。
+            event: 事件来源标注（写入调用日志）。
 
         Returns:
             生成的文本或降级文案。
@@ -109,6 +199,7 @@ class LLMService:
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=temperature,
+            event=event,
         )
         if result:
             return result
@@ -151,6 +242,7 @@ class LLMService:
             system_prompt="你是一个 JSON 生成助手，只返回合法的 JSON 数组。",
             temperature=0.5,
             max_tokens=2048,
+            event="schedule_generation",
         )
         if not response:
             return []

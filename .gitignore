@@ -17,6 +17,10 @@ env/
 # ── 运行时生成的数据文件（首次启动自动创建）─────────────────
 data/
 
+# ── 运行时配置：含 target_qq / lover_name 等个人数据，严禁提交 ──
+config.toml
+config_back/
+
 # ── 测试与开发文件（不随插件发布；本地保留运行）─────────────
 tests/
 conftest.py

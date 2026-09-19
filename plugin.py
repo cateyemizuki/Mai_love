@@ -25,10 +25,12 @@ from maibot_sdk import API, Command, HookHandler, MaiBotPlugin, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .affection_manager import AffectionManager
+from .cateye_client import CateyeClient
 from .config import MaiLoverPluginSettings
 from .constants import AFFECTION_DESCRIPTIONS
 from .external_schedule import ExternalScheduleSource
 from .holiday_service import HolidayService
+from .llm_logger import LLMCallLogger
 from .llm_service import LLMService
 from .memory_manager import MemoryManager
 from .message_service import MessageService
@@ -47,7 +49,7 @@ class MaiLoverPlugin(MaiBotPlugin):
     - Tools: mai_lover_status / mai_lover_schedule / mai_lover_send_message /
              mai_lover_affection / mai_lover_config / mai_lover_current_activity
     - Commands: /mai_status / /mai_schedule / /mai_affection / /mai_help /
-                /mai_config / /mai_test
+                /mai_config / /mai_llm_log / /mai_test
     """
 
     config_model = MaiLoverPluginSettings
@@ -60,6 +62,8 @@ class MaiLoverPlugin(MaiBotPlugin):
         self._affection_mgr: Optional[AffectionManager] = None
         self._memory_mgr: Optional[MemoryManager] = None
         self._llm_svc: Optional[LLMService] = None
+        self._llm_logger: Optional[LLMCallLogger] = None
+        self._cateye: Optional[CateyeClient] = None
         self._message_svc: Optional[MessageService] = None
         self._holiday_svc: Optional[HolidayService] = None
         self._external_src: Optional[ExternalScheduleSource] = None
@@ -91,7 +95,15 @@ class MaiLoverPlugin(MaiBotPlugin):
         self._affection_mgr = AffectionManager(data_dir)
         self._affection_mgr.update_level(self.config.affection.current_level)
         self._memory_mgr = MemoryManager(self._affection_mgr)
-        self._llm_svc = LLMService(self.ctx, self.config)
+        # LLM 调用日志（v2.4.0）：记录插件发起的全部模型请求回复，
+        # 供 /mai_llm_log 合并转发查看；加载时顺手清理过期文件
+        self._llm_logger = LLMCallLogger(
+            data_dir,
+            enabled=self.config.llm_log.enabled,
+            retention_days=self.config.llm_log.retention_days,
+        )
+        self._llm_logger.cleanup()
+        self._llm_svc = LLMService(self.ctx, self.config, call_logger=self._llm_logger)
         lover_name = self._get_lover_name()
         self._message_svc = MessageService(
             self.ctx, self.config, self._affection_mgr, lover_name
@@ -104,12 +116,16 @@ class MaiLoverPlugin(MaiBotPlugin):
             data_dir, self.config, self._llm_svc, self._holiday_svc,
             external_source=self._external_src,
         )
+        # 恋人电脑联动（v2.4.0）：想念/早晚安触发时查看恋人在电脑上干什么
+        self._cateye = CateyeClient(self.ctx, self.config, self._llm_svc)
 
         # 创建调度器（v2.0.0: 仅 4 个依赖，不再传 message_svc/memory_mgr；
-        # v2.3.0: 传入 LLM 服务供想念触发前的 LLM 把关使用）
+        # v2.3.0: 传入 LLM 服务供想念触发前的 LLM 把关使用；
+        # v2.4.0: 传入恋人电脑客户端供触发时查看电脑状态）
         self._scheduler = Scheduler(
             self.ctx, self.config, self._affection_mgr, self._schedule_gen,
             llm_service=self._llm_svc,
+            cateye_client=self._cateye,
         )
         self._scheduler.set_personality(self._cached_personality)
         if lover_name:
@@ -178,6 +194,13 @@ class MaiLoverPlugin(MaiBotPlugin):
             self._message_svc._config = self.config
         if self._schedule_gen is not None:
             self._schedule_gen._config = self.config
+        if self._cateye is not None:
+            self._cateye._config = self.config
+        if self._llm_logger is not None:
+            self._llm_logger.update_settings(
+                self.config.llm_log.enabled,
+                self.config.llm_log.retention_days,
+            )
 
         # 停止旧调度器并重建实例（v2.3.1：复用同一实例时，旧循环若正卡在
         # tick 中，start() 清除 stop_event 后会与新循环并存，形成双循环竞态）
@@ -187,6 +210,7 @@ class MaiLoverPlugin(MaiBotPlugin):
             self._scheduler = Scheduler(
                 self.ctx, self.config, self._affection_mgr, self._schedule_gen,
                 llm_service=self._llm_svc,
+                cateye_client=self._cateye,
             )
             self._scheduler.set_personality(self._cached_personality)
             lover_name = self._get_lover_name()
@@ -447,6 +471,7 @@ class MaiLoverPlugin(MaiBotPlugin):
                 fallback="想你了呢~在忙什么呀？",
                 system_prompt=f"你是一个温柔体贴的虚拟恋人「{name}」。",
                 temperature=0.8,
+                event="tool_send_message",
             )
 
         final_text = self._message_svc.append_affection_suffix(message)
@@ -663,6 +688,7 @@ class MaiLoverPlugin(MaiBotPlugin):
             "/mai_schedule  — 查看今日完整日程\n"
             "/mai_affection — 调整好感度档位: /mai_affection <0|1|2>\n"
             "/mai_config    — 查看当前插件配置摘要\n"
+            "/mai_llm_log   — 查看 LLM 调用日志: /mai_llm_log [天数]\n"
             "/mai_test      — 发送一条测试消息（验证发送通道）"
         )
         try:
@@ -708,6 +734,113 @@ class MaiLoverPlugin(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.error(f"cmd_mai_config 发送失败: {e}")
             return False, f"发送失败: {e}", 2
+
+    @Command(
+        name="/mai_llm_log",
+        pattern=r"(?<!\S)/mai_llm_log(?:\s+(?P<mai_days>\S+))?\s*$",
+        description="查看插件发起的 LLM 调用日志（合并转发）。用法: /mai_llm_log [天数]",
+    )
+    async def cmd_mai_llm_log(
+        self, mai_days: str = "", **kwargs: Any
+    ) -> tuple[bool, str, int]:
+        """查看 LLM 调用日志：每次请求一条消息，合并转发发出。
+
+        可选天数参数限定回看范围（默认 = 配置的保留天数）。
+        """
+        if not self._authorize_command(kwargs):
+            return True, "没有权限", 2
+        stream_id = str(kwargs.get("stream_id", ""))
+
+        if self._llm_logger is None or not self._llm_logger.enabled:
+            msg = "LLM 调用日志未启用（配置 [llm_log] enabled = true 后开始记录）。"
+            try:
+                await self.ctx.send.text(text=msg, stream_id=stream_id)
+            except Exception as e:
+                self.ctx.logger.error(f"cmd_mai_llm_log 提示发送失败: {e}")
+            return True, "日志未启用", 2
+
+        days: Optional[int] = None
+        if mai_days:
+            try:
+                days = max(1, min(30, int(str(mai_days).strip())))
+            except ValueError:
+                days = None
+
+        entries = self._llm_logger.read_entries(days)
+        if not entries:
+            msg = f"最近 {days or self._llm_logger.retention_days} 天没有 LLM 调用日志。"
+            try:
+                await self.ctx.send.text(text=msg, stream_id=stream_id)
+            except Exception as e:
+                self.ctx.logger.error(f"cmd_mai_llm_log 空提示发送失败: {e}")
+            return True, "暂无日志", 2
+
+        records = self._build_llm_log_records(
+            entries, self._llm_logger.retention_days
+        )
+        try:
+            await self.ctx.send.forward(records, stream_id)
+            return True, "日志已合并转发", 2
+        except Exception as forward_exc:
+            # 适配器不支持转发时回退为纯文本
+            self.ctx.logger.warning(f"LLM 日志合并转发失败，回退纯文本: {forward_exc}")
+            fallback = "\n\n".join(
+                str(record["segments"][0]["content"]) for record in records
+            )
+            try:
+                await self.ctx.send.text(text=fallback, stream_id=stream_id)
+                return True, "日志已发送（文本回退）", 2
+            except Exception as e:
+                self.ctx.logger.error(f"cmd_mai_llm_log 回退发送失败: {e}")
+                return False, f"发送失败: {e}", 2
+
+    @staticmethod
+    def _build_llm_log_records(
+        entries: list[dict[str, Any]], retention_days: int
+    ) -> list[dict[str, Any]]:
+        """把日志条目构造成合并转发节点：每次请求一条消息。
+
+        首条为汇总（时间范围 / 总条数 / 保留天数），其后按时间升序逐条
+        展示「[时间] 事件 · 模型 · 状态 + 回复内容」。最多展示最近 50 条。
+        """
+        max_records = 50
+        total = len(entries)
+        shown = entries[-max_records:]
+
+        first_time = str(entries[0].get("time", "?"))
+        last_time = str(entries[-1].get("time", "?"))
+        header = (
+            "📋 麦麦恋人 LLM 调用日志\n"
+            f"时间范围: {first_time} ~ {last_time}\n"
+            f"共 {total} 条（展示最近 {len(shown)} 条） | 保留 {retention_days} 天"
+        )
+        records: list[dict[str, Any]] = [
+            {
+                "user_id": "0",
+                "nickname": "LLM调用日志",
+                "segments": [{"type": "text", "content": header}],
+            }
+        ]
+        for entry in shown:
+            status = "✅" if entry.get("success") else "❌"
+            body = str(entry.get("response") or "")
+            error = str(entry.get("error") or "")
+            if error:
+                body = f"{body}（错误: {error}）" if body else f"（错误: {error}）"
+            line = (
+                f"[{entry.get('time', '?')}] "
+                f"{entry.get('event', '?')} · "
+                f"{entry.get('model') or '默认模型'} · {status}\n"
+                f"{body or '（空回复）'}"
+            )
+            records.append(
+                {
+                    "user_id": "0",
+                    "nickname": "LLM调用日志",
+                    "segments": [{"type": "text", "content": line}],
+                }
+            )
+        return records
 
     @Command(name="/mai_test", pattern=r"(?<!\S)/mai_test\s*$", description="发送一条测试消息以验证发送通道")
     async def cmd_mai_test(self, **kwargs: Any) -> tuple[bool, str, int]:

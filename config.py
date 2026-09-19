@@ -11,7 +11,11 @@ from typing import Any, ClassVar, Dict, Literal, Optional
 from maibot_sdk import Field, PluginConfigBase
 from pydantic import field_validator
 
-from .constants import MISS_CONFIRM_PROMPT_DEFAULT, MISS_REASON_PROMPT_DEFAULT
+from .constants import (
+    MISS_CONFIRM_PROMPT_DEFAULT,
+    MISS_REASON_PROMPT_DEFAULT,
+    SCREEN_DESCRIBE_PROMPT_DEFAULT,
+)
 
 
 def _schema_i18n(
@@ -44,7 +48,7 @@ def _schema_i18n(
 # 插件总开关
 # ---------------------------------------------------------------------------
 
-CONFIG_SCHEMA_VERSION = "2.3.1"
+CONFIG_SCHEMA_VERSION = "2.4.0"
 
 
 class PluginConfig(PluginConfigBase):
@@ -607,12 +611,159 @@ class AffectionConfig(PluginConfigBase):
 
 
 # ---------------------------------------------------------------------------
+# 恋人电脑（cateye 联动）
+# ---------------------------------------------------------------------------
+
+
+class CateyeConfig(PluginConfigBase):
+    """联动「cateye 统一连接插件」（cateye.connect-hub）：想念/早晚安触发时
+    看一眼恋人电脑，让麦麦知道 TA 在干什么。需要 cateye 客户端在用户电脑上在线。"""
+
+    __ui_label__: ClassVar[str] = "恋人电脑（cateye）"
+    __ui_order__: ClassVar[int] = 6
+
+    enabled: bool = Field(
+        default=False,
+        description="开启后，想念回复与早安/晚安触发时会通过 cateye 插件查看恋人电脑："
+                    "已连接则截图并用视觉模型转成一句话描述拼进提示词；未连接则告诉 LLM"
+                    "「恋人的电脑没开」。需要同时安装 cateye.connect-hub 插件且客户端在线。",
+        json_schema_extra={
+            "hint": "默认关闭。开启前请确认已安装「cateye 统一连接插件」并在用户电脑上跑起客户端。",
+            "i18n": _schema_i18n(
+                label_en="Cateye Integration",
+                label_ja="cateye 連携",
+                hint_en="On miss/morning/night triggers, peek at the lover's PC via the cateye hub plugin.",
+                hint_ja="発話時に cateye 経由で恋人の PC 状態を確認します。",
+            ),
+            "label": "启用恋人电脑联动",
+            "order": 0,
+        },
+    )
+    screenshot_blur: int = Field(
+        default=0,
+        description="截图模糊半径（0-64）。0=清晰截图；介意隐私可设 30 左右（视觉模型仍能看出大概在干什么）。",
+        json_schema_extra={
+            "hint": "0=不模糊看得最清；数值越大越模糊。",
+            "i18n": _schema_i18n(
+                label_en="Screenshot Blur",
+                label_ja="スクリーンショットぼかし",
+                hint_en="0 = clear. Larger values blur more (privacy).",
+                hint_ja="0 = 鮮明。大きいほどぼかします。",
+            ),
+            "label": "截图模糊半径",
+            "order": 1,
+        },
+    )
+    vlm_task: str = Field(
+        default="vlm",
+        description="截图理解使用的视觉模型任务名（主程序 model_config.toml 的任务键，默认 vlm）。",
+        json_schema_extra={
+            "hint": "宿主不支持图片输入时截图描述自动降级为「电脑开着但没看清」。",
+            "i18n": _schema_i18n(
+                label_en="Vision Task Name",
+                label_ja="視覚タスク名",
+                hint_en="Model task used to interpret the screenshot (host model task key).",
+                hint_ja="スクリーンショット解析に使うタスク名。",
+            ),
+            "label": "视觉模型任务名",
+            "order": 2,
+        },
+    )
+    timeout_seconds: float = Field(
+        default=20.0,
+        description="查看电脑（截图 + 视觉理解）的整体超时秒数，超时不阻塞巡检，本轮按不可用处理。",
+        json_schema_extra={
+            "hint": "秒。截图慢可调大；超时不会卡住主动消息，只会本轮看不到电脑状态。",
+            "i18n": _schema_i18n(
+                label_en="Peek Timeout (s)",
+                label_ja="確認タイムアウト（秒）",
+                hint_en="Overall timeout for screenshot + description.",
+                hint_ja="スクリーンショット＋解析全体のタイムアウト。",
+            ),
+            "label": "查看超时（秒）",
+            "order": 3,
+        },
+    )
+    describe_prompt: str = Field(
+        default=SCREEN_DESCRIBE_PROMPT_DEFAULT,
+        description="屏幕截图的视觉理解提示词（随截图发给视觉模型，要求一句话描述用户在干什么）。",
+        json_schema_extra={
+            "hint": "想让麦麦关注别的细节可以改这里。",
+            "i18n": _schema_i18n(
+                label_en="Screen Describe Prompt",
+                label_ja="画面説明プロンプト",
+                hint_en="Prompt sent to the vision model along with the screenshot.",
+                hint_ja="スクリーンショットと共に視覚モデルへ送るプロンプト。",
+            ),
+            "label": "屏幕理解提示词",
+            "order": 4,
+            "rows": 4,
+        },
+    )
+
+    @field_validator("screenshot_blur", mode="before")
+    @classmethod
+    def _normalize_blur(cls, value: Any) -> int:
+        return _normalize_int_in_range(value, 0, 0, 64)
+
+
+# ---------------------------------------------------------------------------
+# LLM 调用日志
+# ---------------------------------------------------------------------------
+
+
+class LLMLogConfig(PluginConfigBase):
+    """插件发起的 LLM 调用日志：记录事件来源、时间与模型回复，供 /mai_llm_log 查看。"""
+
+    __ui_label__: ClassVar[str] = "LLM 调用日志"
+    __ui_order__: ClassVar[int] = 7
+
+    enabled: bool = Field(
+        default=True,
+        description="记录本插件发起的所有 LLM 请求的回复内容（含事件来源与时间），"
+                    "用 /mai_llm_log 命令通过合并转发查看。不影响正常功能。",
+        json_schema_extra={
+            "hint": "想排查「麦麦为什么这么说/把关为什么驳回」就开着。",
+            "i18n": _schema_i18n(
+                label_en="LLM Call Log",
+                label_ja="LLM 呼び出しログ",
+                hint_en="Record responses of all plugin-initiated LLM calls; view via /mai_llm_log.",
+                hint_ja="プラグイン発の LLM 応答を記録し、/mai_llm_log で確認します。",
+            ),
+            "label": "启用 LLM 调用日志",
+            "order": 0,
+        },
+    )
+    retention_days: int = Field(
+        default=3,
+        description="日志保留天数，过期自动清理。",
+        json_schema_extra={
+            "hint": "默认 3 天；1-30 之间。",
+            "i18n": _schema_i18n(
+                label_en="Retention (days)",
+                label_ja="保持日数",
+                hint_en="Older log files are deleted automatically.",
+                hint_ja="古いログは自動削除されます。",
+            ),
+            "label": "日志保留天数",
+            "order": 1,
+        },
+    )
+
+    @field_validator("retention_days", mode="before")
+    @classmethod
+    def _normalize_retention(cls, value: Any) -> int:
+        return _normalize_int_in_range(value, 3, 1, 30)
+
+
+# ---------------------------------------------------------------------------
 # 顶层配置聚合
 # ---------------------------------------------------------------------------
 
 
 class MaiLoverPluginSettings(PluginConfigBase):
-    """麦麦恋人插件完整配置。包含开关、白名单、调度、概率、时间窗、好感度六大模块。"""
+    """麦麦恋人插件完整配置。包含开关、白名单、调度、概率、时间窗、好感度、
+    恋人电脑联动、LLM 日志八大模块。"""
 
     plugin: PluginConfig = Field(default_factory=PluginConfig)
     whitelist: WhitelistConfig = Field(default_factory=WhitelistConfig)
@@ -620,6 +771,8 @@ class MaiLoverPluginSettings(PluginConfigBase):
     probability: ProbabilityConfig = Field(default_factory=ProbabilityConfig)
     time_windows: TimeWindowsConfig = Field(default_factory=TimeWindowsConfig)
     affection: AffectionConfig = Field(default_factory=AffectionConfig)
+    cateye: CateyeConfig = Field(default_factory=CateyeConfig)
+    llm_log: LLMLogConfig = Field(default_factory=LLMLogConfig)
 
 
 # ---------------------------------------------------------------------------

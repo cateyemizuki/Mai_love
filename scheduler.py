@@ -48,6 +48,7 @@ class Scheduler:
         affection_manager: AffectionManager,
         schedule_generator: ScheduleGenerator,
         llm_service: Optional[LLMService] = None,
+        cateye_client: Optional[Any] = None,
     ) -> None:
         """初始化调度器。
 
@@ -57,12 +58,14 @@ class Scheduler:
             affection_manager: 好感度管理器。
             schedule_generator: 日程生成器。
             llm_service: LLM 服务（想念触发的 LLM 把关用；None = 跳过把关）。
+            cateye_client: 恋人电脑联动客户端（None = 不查看电脑状态）。
         """
         self._ctx: Any = ctx
         self._config: MaiLoverPluginSettings = config
         self._affection: AffectionManager = affection_manager
         self._schedule_gen: ScheduleGenerator = schedule_generator
         self._llm: Optional[LLMService] = llm_service
+        self._cateye: Optional[Any] = cateye_client
         self._stop_event: asyncio.Event = asyncio.Event()
         self._target_qq: str = ""
         self._stream_id: str = ""
@@ -327,17 +330,24 @@ class Scheduler:
                     if self._affection.today_speak_count() < non_night_budget:
                         if not self._is_in_cooldown(now):
                             if random.random() < miss_speak_rate:
+                                # 电脑状态本次巡检只取一份：把关与触发复用，
+                                # 避免一次触发连截两张屏
+                                computer_context = await self._get_computer_context(now)
                                 # LLM 把关：以角色身份判断此刻开口是否自然，
                                 # 驳回则本轮不触发（30 分钟冷却内不重复判断）
                                 if self._miss_llm_check_enabled():
                                     if not await self._confirm_missing_with_llm(
-                                        hours_since_last, now
+                                        hours_since_last, now, computer_context
                                     ):
                                         pass  # 驳回：本轮不触发
                                     else:
-                                        await self._trigger_missing(hours_since_last)
+                                        await self._trigger_missing(
+                                            hours_since_last, computer_context
+                                        )
                                 else:
-                                    await self._trigger_missing(hours_since_last)
+                                    await self._trigger_missing(
+                                        hours_since_last, computer_context
+                                    )
 
         # ==============================
         # B级：日程节点匹配 / 日常巡检
@@ -398,32 +408,43 @@ class Scheduler:
             return False
 
     async def _trigger_morning(self) -> None:
-        """触发早安 planner。"""
+        """触发早安 planner（触发前看一眼恋人的电脑）。"""
         self._ctx.logger.info("S级触发: 早安")
-        success = await self._trigger_planner("morning", "早上好，可以说早安")
+        reason = "早上好，可以说早安" + await self._get_computer_context(datetime.now())
+        success = await self._trigger_planner("morning", reason)
         if success:
             self._affection.set_morning_sent()
 
     async def _trigger_night(self) -> None:
-        """触发晚安 planner。"""
+        """触发晚安 planner（触发前看一眼恋人的电脑）。"""
         self._ctx.logger.info("S级触发: 晚安")
-        success = await self._trigger_planner("night", "晚上好，可以说晚安")
+        reason = "晚上好，可以说晚安" + await self._get_computer_context(datetime.now())
+        success = await self._trigger_planner("night", reason)
         if success:
             self._affection.set_night_sent()
 
-    async def _trigger_missing(self, hours_since_last: float) -> None:
+    async def _trigger_missing(
+        self, hours_since_last: float, computer_context: str = ""
+    ) -> None:
         """触发想念 planner。
 
         Args:
             hours_since_last: 距用户最后一条消息的小时数（填入 reason 提示词）。
+            computer_context: 恋人电脑状态文案（把关与触发复用同一份，避免重复截图）。
         """
         self._ctx.logger.info(
             f"A级触发: 想念机制（沉默 {hours_since_last:.1f} 小时）"
         )
-        reason = self._format_miss_reason(hours_since_last)
+        reason = self._format_miss_reason(hours_since_last) + computer_context
         success = await self._trigger_planner("missing", reason)
         if success:
             self._affection.set_miss_sent()
+
+    async def _get_computer_context(self, now: datetime) -> str:
+        """获取恋人电脑状态文案（未启用联动 / 无客户端时返回空串）。"""
+        if self._cateye is None or not self._cateye.is_enabled():
+            return ""
+        return await self._cateye.get_computer_context(now)
 
     # ── 想念机制辅助（v2.3.0）────────────────────────────────────────
 
@@ -485,17 +506,21 @@ class Scheduler:
             )
 
     async def _confirm_missing_with_llm(
-        self, hours_since_last: float, now: datetime
+        self,
+        hours_since_last: float,
+        now: datetime,
+        computer_context: str = "",
     ) -> bool:
         """想念触发前的 LLM 把关：此刻主动表达想念是否自然。
 
         用配置的 ``miss_confirm_prompt`` 模板构造提示词（含沉默时长、当前
-        时间与当前活动上下文），LLM 回复 Y 才放行；N、无法解析或调用失败
-        一律视为驳回——宁可这轮不打扰，也不硬接话题。
+        时间、当前活动与恋人电脑状态），LLM 回复 Y 才放行；N、无法解析或
+        调用失败一律视为驳回——宁可这轮不打扰，也不硬接话题。
 
         Args:
             hours_since_last: 距用户最后一条消息的小时数。
             now: 当前时间（复用 _tick 的 now）。
+            computer_context: 恋人电脑状态文案（"" = 未启用联动）。
 
         Returns:
             True = 放行触发；False = 驳回（新鲜驳回时记录驳回时间，
@@ -529,10 +554,12 @@ class Scheduler:
                 hours=f"{hours_since_last:.1f}",
                 activity_context=activity_context,
             )
+        if computer_context:
+            prompt += f"\n{computer_context}"
 
         assert self._llm is not None  # _miss_llm_check_enabled 已保证
         response = await self._llm.generate(
-            prompt=prompt, temperature=0.2, max_tokens=16
+            prompt=prompt, temperature=0.2, max_tokens=16, event="miss_confirm"
         )
         verdict = self._parse_missing_confirm(response)
         if verdict is True:
