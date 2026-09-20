@@ -37,6 +37,25 @@ from .message_service import MessageService
 from .schedule_generator import ScheduleGenerator
 from .scheduler import Scheduler
 
+# ──────────────────────────────────────────────────────────────────────────
+# [LOCAL-PATCH:cateye] 本地修改（基于上游 v2.4.0），共两处，均已用该标记注释：
+#   1) planner 活动注入的 payload 守卫：原先 payload > 1MB 就整体跳过注入，而宿主把图片
+#      以 image_base64 内联进 items 快照（request_snapshot.py:264-271），带几张图的上下文
+#      常态就是 2–12MB —— 线上日志实测注入几乎从未生效。现改为"超限则按体积从大到小把
+#      图片 part 换成文本占位符后照常注入"。
+#   2) 主动发言回合注入「回复目标约束」：宿主 maisaka.proactive.trigger 能力只有
+#      stream_id/intent/reason/priority/metadata（capabilities/core.py:219-250），**没有
+#      任何回复目标参数**，回复对象完全由 planner 自主决定；主动私聊那一轮没有用户消息
+#      可锚，目标就会落到 bot 自己上一条发言。这里用一条软约束把目标引导回对方，只在最近
+#      _PROACTIVE_RULE_WINDOW_SECONDS 秒内有过 proactive trigger 时注入，不影响普通回合。
+# ──────────────────────────────────────────────────────────────────────────
+#: 超过此体积就先省略图片再注入；宿主单帧上限 16MB（transport/base.py:18），留编码余量。
+_MAX_INJECT_PAYLOAD_BYTES = 8 * 1024 * 1024
+#: 距离上次 proactive trigger 多久内，认为当前 planner 回合是主动发言回合。
+_PROACTIVE_RULE_WINDOW_SECONDS = 90.0
+#: 省略图片时替换成的文本占位符（不能直接删 part，否则 item 可能没有 part）。
+_IMAGE_OMITTED_PLACEHOLDER = "[图片已省略：为控制上下文体积]"
+
 
 class MaiLoverPlugin(MaiBotPlugin):
     """麦麦恋人插件主类。
@@ -282,19 +301,21 @@ class MaiLoverPlugin(MaiBotPlugin):
         else:
             return {"action": "continue", "modified_kwargs": kwargs}
 
-        # 防护：payload 过大时跳过注入（避免触发主程序帧大小限制）
-        try:
-            import json as _json
-            payload_size = len(_json.dumps(payload, default=str, ensure_ascii=False))
-            if payload_size > 1_000_000:  # 1MB
-                self.ctx.logger.warning(
-                    f"planner payload 过大 ({payload_size} bytes)，跳过活动注入"
-                )
-                return {"action": "continue", "modified_kwargs": kwargs}
-        except Exception:
-            pass
+        # [LOCAL-PATCH:cateye] 超限不再整体跳过：先把最大的图片 part 换成文本占位符再注入。
+        payload, omitted_images = self._shrink_payload_for_injection(payload)
+        if payload is None:
+            self.ctx.logger.warning(
+                f"planner payload 过大且裁剪后仍超限 (>{_MAX_INJECT_PAYLOAD_BYTES} bytes)，跳过活动注入"
+            )
+            return {"action": "continue", "modified_kwargs": kwargs}
+        if omitted_images:
+            self.ctx.logger.info(
+                f"planner payload 过大，已省略 {omitted_images} 张图片以完成活动注入"
+            )
 
         suffix = await self._build_activity_suffix()
+        # [LOCAL-PATCH:cateye] 主动发言回合追加回复目标约束（宿主无法强制目标，只能软约束）
+        suffix += self._build_proactive_target_rule()
         if not suffix:
             return {"action": "continue", "modified_kwargs": kwargs}
 
@@ -390,6 +411,85 @@ class MaiLoverPlugin(MaiBotPlugin):
         insert_at = (first_system_idx + 1) if first_system_idx is not None else 0
         new_payload.insert(insert_at, injection)
         return new_payload
+
+    # ── [LOCAL-PATCH:cateye] 以下两个辅助方法为本地新增 ────────────────────
+
+    @staticmethod
+    def _payload_json_size(payload: Any) -> int:
+        """估算 payload 的 JSON 体积（与宿主 RPC 帧编码量级一致）。"""
+
+        import json as _json
+
+        return len(_json.dumps(payload, default=str, ensure_ascii=False))
+
+    @classmethod
+    def _shrink_payload_for_injection(
+        cls, payload: list[dict[str, Any]]
+    ) -> tuple[Optional[list[dict[str, Any]]], int]:
+        """payload 超过阈值时，按体积从大到小把图片 part 换成文本占位符。
+
+        宿主把图片以 ``image_base64`` 内联进 items 快照（``request_snapshot.py:264-271``），
+        所以带图的上下文常态就是 2–12MB，而宿主单帧上限是 16MB（``transport/base.py:18``）。
+        原先"超过 1MB 就整体跳过注入"会让活动注入几乎永不生效；这里改为省略最大的图片
+        part——替换成文本占位符而不是删掉，保证 item 仍有 part、宿主反序列化不会失败。
+
+        Returns:
+            ``(可注入的 payload 或 None, 被省略的图片数)``；``None`` 表示裁剪后仍超限。
+        """
+
+        size = cls._payload_json_size(payload)
+        if size <= _MAX_INJECT_PAYLOAD_BYTES:
+            return payload, 0
+
+        candidates: list[tuple[int, int, int]] = []
+        for item_index, item in enumerate(payload):
+            if not isinstance(item, dict):
+                continue
+            parts = item.get("parts")
+            if not isinstance(parts, list):
+                continue
+            for part_index, part in enumerate(parts):
+                if isinstance(part, dict) and part.get("type") == "image":
+                    candidates.append((cls._payload_json_size(part), item_index, part_index))
+        candidates.sort(reverse=True)
+
+        placeholder: dict[str, Any] = {"type": "text", "text": _IMAGE_OMITTED_PLACEHOLDER}
+        placeholder_size = cls._payload_json_size(placeholder)
+        items: list[Any] = [dict(item) if isinstance(item, dict) else item for item in payload]
+        omitted = 0
+        for part_size, item_index, part_index in candidates:
+            if size <= _MAX_INJECT_PAYLOAD_BYTES:
+                break
+            item = items[item_index]
+            parts = list(item.get("parts") or [])
+            if part_index >= len(parts):
+                continue
+            parts[part_index] = dict(placeholder)
+            item["parts"] = parts
+            size = size - part_size + placeholder_size
+            omitted += 1
+
+        if omitted == 0 or size > _MAX_INJECT_PAYLOAD_BYTES:
+            return None, omitted
+        return items, omitted
+
+    def _build_proactive_target_rule(self) -> str:
+        """主动发言回合给 planner 的回复目标约束（软约束，宿主没有强制目标的参数）。"""
+
+        if self._scheduler is None:
+            return ""
+        last_trigger = self._scheduler.get_last_trigger_time()
+        if last_trigger is None:
+            return ""
+        if (datetime.now() - last_trigger).total_seconds() > _PROACTIVE_RULE_WINDOW_SECONDS:
+            return ""
+        return (
+            "\n【本轮是主动发言】现在是你在主动找对方说话（不是对方来找你）："
+            "\n- 不要回复你自己发送的消息，也不要在发言里引用你自己的消息；"
+            "\n- 优先回应对方最后一条发言；如果最后一条发言是你自己的（对方还没回你），"
+            "就当作对方还没回，直接说新内容或起一个新话题；"
+            "\n- reply 的 msg_id 只能选对方发送的消息。"
+        )
 
     @HookHandler("maisaka.replyer.after_response", mode=HookMode.OBSERVE)
     async def on_replyer_after_response(self, **kwargs: Any) -> None:

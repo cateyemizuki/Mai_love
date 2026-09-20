@@ -4,6 +4,19 @@
 
 > 麦麦有自己的生活 · 主动找你聊天 · 好感度调节温度
 
+## 作者与维护
+
+| | |
+|---|---|
+| **原作者** | octmicy — 上游项目 [octmicy/Mai_love](https://github.com/octmicy/Mai_love) |
+| **现维护者** | cateye — [cateyemizuki](https://github.com/cateyemizuki) |
+| **本仓库** | <https://github.com/cateyemizuki/Mai_love>（上游的 fork，自 **v2.4.1** 起由 cateye 维护） |
+| **许可证** | MIT — 保留上游版权声明 `Copyright (c) 2026 octmicy` |
+
+> 插件 ID `maibot-community.mai-love` **保持不变**（其他插件依赖它调用公开 API），
+> 原作者信息保留在 `_manifest.json` 的 `author` 字段，维护者信息同时写在本 README 与仓库描述中。
+> 本 fork 的逐版本改动见下文「Fork 改动说明」与 [CHANGELOG.md](CHANGELOG.md)。
+
 > **版本要求**：MaiBot ≥ v1.2.3，maibot-plugin-sdk ≥ 2.6.0。
 > 本插件依赖 `maisaka.proactive.trigger` 能力与 `maisaka.*` Hook，其 payload
 > 契约以 1.2.3 为首个文档化基线，更低版本上这些功能会静默失效。
@@ -53,6 +66,21 @@
   版本同步（2.3.1）；`min_version` 抬高至 1.2.3；
 - **调度器热更新竞态修复**：配置热更新时重建 Scheduler 实例，避免复用同一
   `stop_event` 造成新旧巡检循环并存。
+
+### 4. v2.4.1 维护改动（cateye）
+
+两处改动都针对**主动私聊**场景，源码里用 `[LOCAL-PATCH:cateye]` 注释标记（grep 该标记可定位全部改动行）：
+
+- **planner 活动注入不再因载荷过大被整体跳过**：原实现 payload 超过 1MB 就直接 `跳过活动注入`，
+  而宿主会把图片以 `image_base64` 内联进 `items` 快照，**带图上下文常态就是 2–12MB** ——
+  线上日志实测【当前日期/当前状态/好感度】几乎从未进入 planner。现改为阈值 8MB（宿主单帧上限
+  16MB），超限时按体积从大到小把图片 part 换成文本占位符后**照常注入**；无图片可裁才回退跳过。
+- **主动发言回合注入「回复目标约束」**：宿主 `maisaka.proactive.trigger` 能力只有
+  `stream_id / intent / reason / priority / metadata`，**没有任何回复目标参数**，回复对象完全由
+  planner 自主决定；主动私聊那一轮没有用户消息可锚，目标就会落到 bot 自己上一条发言
+  （群里看起来像 bot 在引用自己说话）。现在在最近 90 秒内有过主动触发时，向 planner 追加一条约束：
+  不要回复/引用你自己发送的消息、优先回应对方最后一条发言、`reply` 的 `msg_id` 只能选对方的消息。
+- 改动明细（含宿主源码位置与验证方式）见文末「[v2.4.1 改动明细](#v241-改动明细cateye)」。
 
 > 上游原有无外部日程开关，所有改动向后兼容：不开启 `use_external_schedule` 时行为与上游完全一致。
 
@@ -398,6 +426,50 @@ A: 需要 `cateye.enabled = true` 且同时安装「cateye 统一连接插件」
 
 **Q: 为什么想看 LLM 日志却提示未启用？**
 A: 检查 `[llm_log] enabled` 是否为 true；日志只记录插件自己发起的调用（日程生成/想念把关/Tool 消息/屏幕理解），planner 日常聊天回复由宿主产生，不在记录范围。
+
+---
+
+## v2.4.1 改动明细（cateye）
+
+> 本节是上文「Fork 改动说明」第 4 项的详细版。v2.4.1 的 2 处改动在源码里全部用
+> `[LOCAL-PATCH:cateye]` 注释标记（在 `plugin.py` 里 grep 该标记即可定位全部改动行）。
+> **同步上游新版本时，记得把这两处改动重新应用一次**（上游更新后不会自动带上）。
+
+### 1. planner 活动注入不再因 payload 过大被整体跳过
+
+**问题**：原实现里 payload 超过 **1MB** 就直接 `跳过活动注入`。而宿主会把图片以
+`image_base64` 内联进 `items` 快照（`src/llm_models/request_snapshot.py:264-271`），
+所以**只要上下文里有图，payload 常态就是 2–12MB** → 线上日志实测这条注入几乎从未生效，
+【当前日期】【当前状态】【好感度】全都没进 planner。
+
+**改法**：阈值改为 `_MAX_INJECT_PAYLOAD_BYTES = 8MB`（宿主单帧上限 16MB，
+见 `src/plugin_runtime/transport/base.py:18`）；超限时**按体积从大到小把图片 part 换成文本占位符**
+（`[图片已省略：为控制上下文体积]`）后照常注入——替换而不是删除 part，保证 item 仍有 part、
+宿主反序列化不会失败。无图片可裁时才回退为跳过。
+
+### 2. 主动发言回合注入「回复目标约束」
+
+**问题**：宿主 `maisaka.proactive.trigger` 能力只有
+`stream_id / intent / reason / priority / metadata`（`src/plugin_runtime/capabilities/core.py:219-250`），
+**没有任何回复目标参数**——它只做"注入一条合成任务消息 + `_arm_forced_turn_state` + 投递 proactive 轮"，
+回复哪一条**完全由 planner 自主决定**。而主动私聊那一轮**没有被回复的用户消息可锚**，
+于是目标就落到 bot 自己上一条发言上（宿主对此是支持的：目标是 bot 自己时，
+`src/chat/replyer/maisaka_generator_base.py:182-189` 会提示"补充说明你自己发送的消息"），
+群里看起来就是 bot 在引用自己说话。
+
+**改法**：在 `maisaka.planner.before_request` 的注入文本末尾追加一段约束（仅在最近
+`_PROACTIVE_RULE_WINDOW_SECONDS = 90` 秒内有过 proactive trigger 时注入，不影响普通用户消息回合）：
+
+```
+【本轮是主动发言】现在是你在主动找对方说话（不是对方来找你）：
+- 不要回复你自己发送的消息，也不要在发言里引用你自己的消息；
+- 优先回应对方最后一条发言；如果最后一条发言是你自己的（对方还没回你），就当作对方还没回，直接说新内容或起一个新话题；
+- reply 的 msg_id 只能选对方发送的消息。
+```
+
+> 这是**软约束**（宿主没有强制目标的参数）。要真正"目标可控"，需要给
+> `maisaka.proactive.trigger` 加一个可选 `reply_target_msg_id` 并让框架写进注入文本或作为
+> `reply` 工具默认参数——那属于改宿主核心。
 
 ---
 

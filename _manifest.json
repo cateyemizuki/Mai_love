@@ -2,17 +2,18 @@
   "manifest_version": 2,
   "id": "maibot-community.mai-love",
   "name": "麦麦恋人",
-  "version": "2.4.0",
-  "description": "私聊专用虚拟恋人插件，会主动找你聊天。基于麦麦的独立日程生活，通过 planner 自主决策什么时候说话、说什么，配合好感度系统调节语气温度。v2.4.0: 恋人电脑联动（[cateye] 开启后想念/早晚安触发时经 cateye.connect-hub 截屏并由视觉模型转述用户在干什么，未连接则告知「电脑没开」）；LLM 调用日志（记录插件发起的模型请求回复/事件/时间，默认保留 3 天，/mai_llm_log 合并转发查看，新增 send.forward 能力）。",
+  "version": "2.4.1",
+  "description": "私聊专用虚拟恋人插件，会主动找你聊天。基于麦麦的独立日程生活，通过 planner 自主决策什么时候说话、说什么，配合好感度系统调节语气温度。v2.4.0: 恋人电脑联动（[cateye] 开启后想念/早晚安触发时经 cateye.connect-hub 截屏并由视觉模型转述用户在干什么，未连接则告知「电脑没开」）；LLM 调用日志（记录插件发起的模型请求回复/事件/时间，默认保留 3 天，/mai_llm_log 合并转发查看，新增 send.forward 能力）。v2.4.1（cateye 维护的 fork，固定上游原作者 octmicy）: 修复 planner 活动注入在带图上下文里被整体跳过（载荷超限时改为省略部分图片再注入，不再丢弃【当前日期/状态/好感度】）；主动发言回合追加回复目标约束（不要回复自己发送的消息），避免私聊主动续话时引用到自己上一条发言。",
   "author": {
-    "name": "octmicy",
+    "name": "octmicy（原作者）",
     "url": "https://github.com/octmicy/Mai_love"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/octmicy/Mai_love",
+    "repository": "https://github.com/cateyemizuki/Mai_love",
     "homepage": "https://github.com/octmicy/Mai_love",
-    "documentation": "https://docs.mai-mai.org"
+    "documentation": "https://docs.mai-mai.org",
+    "issues": "https://github.com/cateyemizuki/Mai_love/issues"
   },
   "host_application": {
     "min_version": "1.2.3",
