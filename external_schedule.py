@@ -60,6 +60,23 @@ class ExternalScheduleSource:
         self._last_fetch_at: float = 0.0
         self._last_nodes: Optional[list[dict[str, Any]]] = None
         self._last_error_at: float = 0.0
+        # v2.4.3：最近一次拉取的状态，供决策日志记录"外部日程到底读到没有"。
+        # 取值：unavailable（还没拉过）/ cached（TTL 内复用）/ fresh（拉到节点）/
+        #       empty（拉到但对方今日无日程）/ error（拉取失败）
+        self._last_status: str = "unavailable"
+        self._last_node_count: int = 0
+
+    @property
+    def last_status(self) -> str:
+        """最近一次拉取的状态（unavailable / cached / fresh / empty / error）。"""
+
+        return self._last_status
+
+    @property
+    def last_node_count(self) -> int:
+        """最近一次拉取到的节点数量。"""
+
+        return self._last_node_count
 
     async def get_today_nodes(self, now: datetime, *, force: bool = False) -> Optional[list[dict[str, Any]]]:
         """拉取并转换"当前 + 未来"日程节点。
@@ -74,14 +91,20 @@ class ExternalScheduleSource:
         """
         now_ts = time.monotonic()
         if not force and self._last_nodes is not None and now_ts - self._last_fetch_at < FETCH_TTL_SECONDS:
+            self._last_status = "cached"
+            self._last_node_count = len(self._last_nodes)
             return self._last_nodes
 
         snapshot = await self._fetch_snapshot()
         if snapshot is None:
+            self._last_status = "error"
+            self._last_node_count = 0
             return None
 
         self._last_nodes = self.snapshot_to_nodes(snapshot)
         self._last_fetch_at = now_ts
+        self._last_status = "fresh" if self._last_nodes else "empty"
+        self._last_node_count = len(self._last_nodes)
         return self._last_nodes
 
     async def _fetch_snapshot(self) -> Optional[dict[str, Any]]:

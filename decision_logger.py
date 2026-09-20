@@ -31,8 +31,14 @@ _CLEANUP_INTERVAL_SECONDS = 3600.0
 _MAX_DETAIL_CHARS = 400
 
 # 允许出现在记录里的动作值
+#: 插件发起了一次主动触发（已入队，等 planner 决定说什么）
 ACTION_TRIGGER = "trigger"
+#: 这一轮没有触发（含原因）
 ACTION_SKIP = "skip"
+#: planner 确认真的生成并发送了回复（对最近一次触发的回执，v2.4.3）
+ACTION_SPOKEN = "spoken"
+#: 只作说明的信息行（例如外部日程拉取结果，v2.4.3）
+ACTION_INFO = "info"
 
 
 class ProactiveDecisionLogger:
@@ -108,15 +114,19 @@ class ProactiveDecisionLogger:
         detail: str = "",
         **fields: Any,
     ) -> None:
-        """记录一轮巡检的决策结论。
+        """记录一条主动行为事件。
 
         任何 I/O 异常都静默吞掉——日志绝不影响正常聊天流程。
 
         Args:
-            action: ``trigger``（真的发言了）或 ``skip``（这一轮没发）。
+            action: 取值见模块常量：``trigger``（发起主动触发）/ ``skip``（本轮没触发）/
+                ``spoken``（planner 确认真的发出去了，v2.4.3）/ ``info``（说明性信息，
+                如外部日程拉取结果，v2.4.3）。
             reason: 机器可读的原因键，如 ``silence`` / ``min_interval`` / ``cooldown`` /
-                ``budget`` / ``dice`` / ``invalid_time_config`` / ``no_candidate``。
-            trigger_type: 触发类型，如 ``morning`` / ``night`` / ``miss`` / ``activity`` / ``daily``。
+                ``budget`` / ``dice`` / ``invalid_time_config`` / ``no_candidate`` /
+                ``external_schedule_fresh`` / ``reply_confirmed`` / ``tool_send_message``。
+            trigger_type: 触发类型，如 ``morning`` / ``night`` / ``miss`` / ``activity`` /
+                ``daily`` / ``tool`` / ``schedule_source``。
             detail: 人类可读的一句话说明。
             **fields: 追加到记录里的决策输入（静默状态、冷却、掷点、预算等）。
         """

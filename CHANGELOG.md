@@ -10,6 +10,49 @@
 > - 插件 ID `maibot-community.mai-love` **保持不变**，其他插件依赖它调用公开 API。
 > - 本 fork 的 2.3.0 – 2.4.0 改动已在 README「Fork 改动说明」中按版本记录；本文件自 v2.4.1 起接管版本变更记录。
 
+## [2.4.3] - 2026-09-20
+
+### 新增（Added）
+
+- **决策日志覆盖「所有主动发言行为」**（此前只记巡检的发起与跳过）：
+  - `spoken`：planner **确认真的生成并发出去了**（由 `maisaka.replyer.after_response`
+    在触发后 90 秒窗口内回执），并标注是哪种触发（`morning/night/miss/daily/activity`）。
+    「触发」只代表已入队，这一条才是"确实说出口了"。
+  - `tool`：planner 通过 `mai_lover_send_message` Tool 主动发消息（不走巡检的那条路径）。
+- **外部日程拉取结果进日志**（`info` / `schedule_source`）：
+  `external_schedule_fresh | cached | empty | error | exception`。
+  这一条正是"日程来自外部插件"时最需要的信息——外部日程模式下本插件不生成日程，
+  若拉不到节点，「日程节点分享」永远不会触发，以前只能靠猜。
+  `fresh` 与 `cached` 归并为同一状态（否则 2 分钟 TTL 与 10 分钟巡检会让两者每轮交替，
+  变成 144 行/天噪声）；**节点数变化、或出现 empty/error/exception 时记录**（失败每次都记）。
+- **`/mai_diag` 新增运行状态行**：巡检是否在跑 / 上次巡检时间 / 巡检间隔 /
+  `stream_id` 是否解析 / 主动开关 / 日程来源与今日节点数 / 外部拉取状态。
+  **日志为空时也带这一行**，并直接点明"若巡检=未运行，说明 stream_id 没解析出来，
+  主动发言整条链路都没跑"——不用再靠猜。
+
+### 修复（Fixed）
+
+- **`ScheduleGenerator.refresh_external_schedule` 改为返回状态字典**
+  （`{"mode","result","nodes","cached_total","detail"}`；非外部模式返回 `internal/noop`）：
+  此前无返回值，调用方无法判断"外部日程到底读到没有"。
+- **`ExternalScheduleSource` 新增 `last_status` / `last_node_count`**
+  （`unavailable` / `cached` / `fresh` / `empty` / `error`），供日志与状态行读取。
+
+### 变更（Changed）
+
+- `Scheduler` 新增 `patrol_status()`、`is_patrolling`、`get_last_trigger_intent()`；
+  巡检任务句柄现在会被保存（用于回答"巡检到底有没有在跑"）；
+  `clear_last_trigger_time()` 同时清除触发类型。
+- `decision_logger` 新增动作常量 `ACTION_SPOKEN` / `ACTION_INFO`
+  （`record_skips=false` 只影响 `skip`，不影响这两类）。
+
+### 兼容性说明
+
+- **只增不改**：新动作类型只影响日志内容与 `/mai_diag` 展示；
+  `refresh_external_schedule` 由返回 `None` 改为返回 dict，上游调用方均忽略返回值，向后兼容。
+- **无新增配置项**，无需迁移；`config_version` 与 manifest 版本同步：**2.4.2 → 2.4.3**。
+- 许可证不变（MIT），上游版权声明原样保留。
+
 ## [2.4.2] - 2026-09-20
 
 ### 新增（Added）

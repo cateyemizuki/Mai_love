@@ -32,7 +32,12 @@ from typing import Any, Optional
 
 from .affection_manager import AffectionManager
 from .config import MaiLoverPluginSettings
-from .decision_logger import ACTION_SKIP, ACTION_TRIGGER, ProactiveDecisionLogger
+from .decision_logger import (
+    ACTION_INFO,
+    ACTION_SKIP,
+    ACTION_TRIGGER,
+    ProactiveDecisionLogger,
+)
 from .llm_service import LLMService
 from .schedule_generator import ScheduleGenerator
 
@@ -119,6 +124,13 @@ class Scheduler:
         self._miss_last_reject_at: Optional[datetime] = None
         # 非法时间窗口配置的告警节流：配置项 -> 已告警过的原始值
         self._invalid_time_warned: dict[str, str] = {}
+        # v2.4.3：巡检状态（供 /mai_diag 自诊断）
+        self._patrol_task: Optional[asyncio.Task[Any]] = None
+        self._last_tick_at: Optional[datetime] = None
+        # 最近一次成功触发的意图（供"确认发言"记录标注是哪种触发）
+        self._last_trigger_intent: str = ""
+        # 上一次记录过的外部日程状态（(result, cached_total)），用于变化时才写日志
+        self._logged_external_status: Optional[tuple[str, int]] = None
 
     def set_target(self, target_qq: str, stream_id: str) -> None:
         """设置白名单目标用户。
@@ -157,9 +169,38 @@ class Scheduler:
         """返回上次成功 proactive trigger 的时间。"""
         return self._last_trigger_time
 
+    def get_last_trigger_intent(self) -> str:
+        """返回上次成功 proactive trigger 的意图（morning/night/missing/daily/activity）。"""
+
+        return self._last_trigger_intent
+
     def clear_last_trigger_time(self) -> None:
-        """清除上次触发时间（replyer Hook 补计后调用）。"""
+        """清除上次触发时间与意图（replyer Hook 补计后调用）。"""
         self._last_trigger_time = None
+        self._last_trigger_intent = ""
+
+    @property
+    def is_patrolling(self) -> bool:
+        """巡检循环是否在运行（供 /mai_diag 自诊断：为空时区分"没启动"与"刚启动"）。"""
+
+        task = self._patrol_task
+        return bool(task is not None and not task.done())
+
+    def patrol_status(self) -> dict[str, Any]:
+        """返回巡检运行状态快照（/mai_diag 汇总行使用）。"""
+
+        return {
+            "running": self.is_patrolling,
+            "last_tick_at": (
+                self._last_tick_at.strftime("%Y-%m-%d %H:%M:%S") if self._last_tick_at else ""
+            ),
+            "interval_minutes": int(getattr(self._config.schedule, "check_interval_minutes", 0) or 0),
+            "stream_id_ready": bool(self._stream_id),
+            "trigger_enabled": bool(
+                getattr(self._config.schedule, "proactive_trigger_enabled", True)
+            ),
+            "external_schedule": self._use_external_schedule(),
+        }
 
     async def start(self) -> None:
         """启动调度引擎。
@@ -203,7 +244,7 @@ class Scheduler:
 
         # 巡检循环需要 stream_id
         if self._stream_id:
-            asyncio.create_task(self._patrol_loop())
+            self._patrol_task = asyncio.create_task(self._patrol_loop())
             self._ctx.logger.info("巡检循环已启动")
         else:
             self._ctx.logger.warning("无 stream_id，巡检循环未启动（日程生成不受影响）")
@@ -217,7 +258,7 @@ class Scheduler:
         if not self._stream_id:
             self._ctx.logger.warning("无 stream_id，无法启动巡检循环")
             return
-        asyncio.create_task(self._patrol_loop())
+        self._patrol_task = asyncio.create_task(self._patrol_loop())
         self._ctx.logger.info("巡检循环已启动（延迟补启）")
 
     async def _daily_generation_loop(self) -> None:
@@ -319,6 +360,7 @@ class Scheduler:
         now = datetime.now()
         current_time = now.strftime("%H:%M")
         current_date = now.strftime("%Y-%m-%d")
+        self._last_tick_at = now
 
         # 确保当日数据已重置
         if self._affection.today_date() != current_date:
@@ -538,8 +580,11 @@ class Scheduler:
         activity_trigger_rate = self._config.probability.activity_trigger_rate
         default_speak_rate = self._config.probability.default_speak_rate
 
-        # 外部日程模式：巡检时刷新（内部带 TTL 节流；非外部模式为 no-op）
-        await self._schedule_gen.refresh_external_schedule(current_date)
+        # 外部日程模式：巡检时刷新（内部带 TTL 节流；非外部模式为 no-op）。
+        # v2.4.3：把拉取结果记进决策日志——外部日程模式下插件不生成日程，
+        # 若这里读不到节点，「日程节点分享」就永远不会触发，必须有据可查
+        external_status = await self._schedule_gen.refresh_external_schedule(current_date)
+        self._log_external_schedule_status(external_status)
 
         schedule = self._schedule_gen.load_cached_schedule(current_date)
         node_matched = False
@@ -636,6 +681,7 @@ class Scheduler:
             )
             self._affection.increment_speak(0.5)  # 先计 0.5，replyer 回复后再补 0.5
             self._last_trigger_time = datetime.now()
+            self._last_trigger_intent = str(intent or "")
             return True
         except Exception as e:
             self._ctx.logger.error(f"proactive_trigger 失败: {e}")
@@ -896,6 +942,34 @@ class Scheduler:
             self._decision_logger.record(action=action, **fields)
         except Exception as e:  # noqa: BLE001 - 日志故障绝不影响巡检
             self._ctx.logger.debug(f"写主动行为决策日志失败（忽略）: {e}")
+
+    def _log_external_schedule_status(self, status: Any) -> None:
+        """把外部日程拉取结果记进决策日志（v2.4.3）。
+
+        只在状态/节点数发生变化时记录。``fresh`` 与 ``cached`` 都表示"读到了"，
+        必须归并成同一种状态——否则 2 分钟 TTL + 10 分钟巡检会让它们每轮交替出现，
+        变成 144 行/天的噪声。``error`` / ``exception`` / ``empty`` 每次都记：
+        这三种才是"为什么一直没有日程节点分享"的答案。
+        """
+
+        if not isinstance(status, dict) or status.get("mode") != "external":
+            return
+        result = str(status.get("result") or "unknown")
+        total = int(status.get("cached_total") or 0)
+        healthy = result in {"fresh", "cached"}
+        key = ("ok" if healthy else result, total)
+        if key == self._logged_external_status and healthy:
+            return
+        self._logged_external_status = key
+        self._log_decision(
+            action=ACTION_INFO,
+            reason=f"external_schedule_{result}",
+            trigger_type="schedule_source",
+            detail=str(status.get("detail") or ""),
+            schedule_mode="external",
+            schedule_nodes=total,
+            schedule_fetched=int(status.get("nodes") or 0),
+        )
 
     def _is_in_cooldown(self, now: datetime) -> bool:
         """检查是否在冷却期内。

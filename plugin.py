@@ -28,7 +28,13 @@ from .affection_manager import AffectionManager
 from .cateye_client import CateyeClient
 from .config import MaiLoverPluginSettings
 from .constants import AFFECTION_DESCRIPTIONS
-from .decision_logger import ProactiveDecisionLogger
+from .decision_logger import (
+    ACTION_INFO,
+    ACTION_SKIP,
+    ACTION_SPOKEN,
+    ACTION_TRIGGER,
+    ProactiveDecisionLogger,
+)
 from .external_schedule import ExternalScheduleSource
 from .holiday_service import HolidayService
 from .llm_logger import LLMCallLogger
@@ -75,6 +81,14 @@ _DIAG_REASON_LABELS: dict[str, str] = {
     "planner_trigger_failed": "触发未入队（stream_id 缺失或开关关闭）",
     "disabled": "主动触发开关已关闭",
     "daily_max_zero": "每日发言上限为 0",
+    # v2.4.3：外部日程与主动发言回执
+    "external_schedule_fresh": "外部日程拉到节点",
+    "external_schedule_cached": "外部日程命中缓存",
+    "external_schedule_empty": "外部日程返回空（对方今日无日程）",
+    "external_schedule_error": "外部日程拉取失败",
+    "external_schedule_exception": "外部日程读取异常",
+    "reply_confirmed": "planner 已生成并发送回复",
+    "tool_send_message": "planner 通过 Tool 主动发消息",
 }
 
 
@@ -534,7 +548,7 @@ class MaiLoverPlugin(MaiBotPlugin):
 
     @HookHandler("maisaka.replyer.after_response", mode=HookMode.OBSERVE)
     async def on_replyer_after_response(self, **kwargs: Any) -> None:
-        """planner 实际生成回复时，补计 0.5 触发数。
+        """planner 实际生成回复时，补计 0.5 触发数，并在决策日志里记一条"确认发言"。
 
         与 _trigger_planner 的 0.5 配合：回复成功总计 1.0，未回复总计 0.5。
         仅在最近 90 秒内有 proactive trigger 时生效，避免误匹配用户消息的回复。
@@ -547,11 +561,42 @@ class MaiLoverPlugin(MaiBotPlugin):
             return  # 没有待确认的 proactive trigger
 
         now = datetime.now()
+        elapsed = (now - last_trigger).total_seconds()
         # 90 秒窗口内的回复视为对 proactive trigger 的响应
-        if (now - last_trigger).total_seconds() < 90:
+        if elapsed < 90:
+            trigger_type = self._scheduler.get_last_trigger_intent()
             self._affection_mgr.increment_speak(0.5)  # 补计 0.5
             self._scheduler.clear_last_trigger_time()
             self.ctx.logger.debug("replyer 回复 detected，补计 0.5 触发数")
+            # v2.4.3：主动触发只代表"已入队"，这一条才是"planner 真的生成并发出去了"的回执
+            self._log_proactive_event(
+                action=ACTION_SPOKEN,
+                reason="reply_confirmed",
+                trigger_type=trigger_type,
+                detail=(
+                    f"planner 已生成回复并发送（距触发 {elapsed:.0f} 秒）"
+                    f"｜触发类型={trigger_type or '未知'}"
+                ),
+            )
+
+    def _log_proactive_event(
+        self, *, action: str, reason: str, trigger_type: str = "", detail: str = "", **fields: Any
+    ) -> None:
+        """把主动发言相关事件写进决策日志（未启用日志时静默 no-op）。
+
+        v2.4.3 新增：让"所有主动发言行为"都有记录，包括
+        planner 确认发言（``spoken``）、Tool 主动发消息（``trigger``/``tool``）、
+        以及外部日程拉取结果（``info``/``schedule_source``）。
+        """
+
+        if self._decision_logger is None:
+            return
+        try:
+            self._decision_logger.record(
+                action=action, reason=reason, trigger_type=trigger_type, detail=detail, **fields
+            )
+        except Exception as e:  # noqa: BLE001 - 日志故障绝不影响正常流程
+            self.ctx.logger.debug(f"写主动行为决策日志失败（忽略）: {e}")
 
     # ── Tools (LLM 可主动调用) ─────────────────────────────────────────
     # 注意：stream_id 由插件内部维护，LLM 调用时无需传入。
@@ -621,6 +666,13 @@ class MaiLoverPlugin(MaiBotPlugin):
             if result:
                 if self._affection_mgr:
                     self._affection_mgr.increment_speak()
+                # v2.4.3：Tool 主动发消息不走巡检，也必须进决策日志，否则"所有主动发言行为"就有漏网
+                self._log_proactive_event(
+                    action=ACTION_TRIGGER,
+                    reason="tool_send_message",
+                    trigger_type="tool",
+                    detail=f"planner 通过 Tool 主动发了一条消息：{final_text[:40]}",
+                )
                 return f"消息已发送: {final_text[:60]}..."
             return f"消息发送失败: 发送返回 False"
         except Exception as e:
@@ -1018,10 +1070,13 @@ class MaiLoverPlugin(MaiBotPlugin):
 
         entries = self._decision_logger.read_entries(days)
         if not entries:
+            status_line = self._build_patrol_status_line()
             msg = (
                 f"最近 {days or self._decision_logger.retention_days} 天没有主动行为决策记录。"
                 "（插件刚加载或日志刚开启时属正常）"
             )
+            if status_line:
+                msg += f"\n{status_line}\n（若「巡检=未运行」，说明 stream_id 没解析出来，主动发言整条链路都没跑）"
             try:
                 await self.ctx.send.text(text=msg, stream_id=stream_id)
             except Exception as e:
@@ -1052,18 +1107,20 @@ class MaiLoverPlugin(MaiBotPlugin):
     ) -> list[dict[str, Any]]:
         """把决策日志条目构造成合并转发节点。
 
-        首条为汇总（时间范围、触发/跳过计数、跳过原因分布、当前节奏配置），
-        其后按时间升序逐条展示；最多展示最近 30 条。
+        首条为汇总（时间范围、触发/确认发言/跳过计数、跳过原因分布、当前节奏配置、
+        巡检与日程来源状态），其后按时间升序逐条展示；最多展示最近 30 条。
         """
         max_records = 30
         total = len(entries)
         shown = entries[-max_records:]
         triggered = sum(1 for e in entries if str(e.get("action")) == "trigger")
-        skipped = total - triggered
+        spoken = sum(1 for e in entries if str(e.get("action")) == "spoken")
+        info = sum(1 for e in entries if str(e.get("action")) == "info")
+        skipped = sum(1 for e in entries if str(e.get("action")) == "skip")
 
         reason_counts: dict[str, int] = {}
         for entry in entries:
-            if str(entry.get("action")) == "trigger":
+            if str(entry.get("action")) != "skip":
                 continue
             key = str(entry.get("reason") or "unknown")
             reason_counts[key] = reason_counts.get(key, 0) + 1
@@ -1074,8 +1131,9 @@ class MaiLoverPlugin(MaiBotPlugin):
         header = (
             "🔍 麦麦恋人 主动行为决策日志\n"
             f"时间范围: {entries[0].get('time', '?')} ~ {entries[-1].get('time', '?')}\n"
-            f"共 {total} 轮巡检：发言 {triggered} 次 / 跳过 {skipped} 次"
-            f"（展示最近 {len(shown)} 条，保留 {retention_days} 天）\n"
+            f"共 {total} 条：发起触发 {triggered} / 确认发言 {spoken} / 跳过 {skipped}"
+            + (f" / 信息 {info}" if info else "")
+            + f"（展示最近 {len(shown)} 条，保留 {retention_days} 天）\n"
             f"跳过原因: {', '.join(f'{k}×{v}' for k, v in top_reasons) if top_reasons else '无'}\n"
             f"当前节奏: 最小间隔 {schedule_cfg.min_trigger_interval_minutes} 分钟"
             f"（早晚安{'豁免' if schedule_cfg.min_interval_exempt_greetings else '不豁免'}）"
@@ -1083,6 +1141,9 @@ class MaiLoverPlugin(MaiBotPlugin):
             f" | 每日上限 {schedule_cfg.daily_max_speak}"
             f" | 静默 {windows.silence_start}-{windows.silence_end}"
         )
+        status_line = self._build_patrol_status_line()
+        if status_line:
+            header += f"\n{status_line}"
         records: list[dict[str, Any]] = [
             {
                 "user_id": "0",
@@ -1094,13 +1155,23 @@ class MaiLoverPlugin(MaiBotPlugin):
         for entry in shown:
             action = str(entry.get("action") or "")
             trigger_type = str(entry.get("trigger_type") or "")
+            reason = str(entry.get("reason") or "unknown")
             if action == "trigger":
                 line = (
-                    f"[{entry.get('time', '?')}] ✅ 发言 · {trigger_type or '?'}\n"
+                    f"[{entry.get('time', '?')}] ✅ 发起触发 · {trigger_type or '?'}\n"
+                    f"{entry.get('detail') or ''}"
+                )
+            elif action == "spoken":
+                line = (
+                    f"[{entry.get('time', '?')}] 🗣️ 确认发言 · {trigger_type or '?'}\n"
+                    f"{entry.get('detail') or ''}"
+                )
+            elif action == "info":
+                line = (
+                    f"[{entry.get('time', '?')}] ℹ️ {reason}\n"
                     f"{entry.get('detail') or ''}"
                 )
             else:
-                reason = str(entry.get("reason") or "unknown")
                 label = _DIAG_REASON_LABELS.get(reason, reason)
                 line = (
                     f"[{entry.get('time', '?')}] ⏭️ 跳过 · {reason}（{label}）\n"
@@ -1114,6 +1185,8 @@ class MaiLoverPlugin(MaiBotPlugin):
                 extras.append(f"预算 {entry.get('budget_used')}/{entry.get('budget_limit', '?')}")
             if entry.get("min_interval_minutes"):
                 extras.append(f"最小间隔 {entry.get('min_interval_minutes')} 分钟")
+            if entry.get("schedule_nodes") is not None:
+                extras.append(f"日程节点 {entry.get('schedule_nodes')} 个")
             if extras:
                 line += "\n（" + "，".join(extras) + "）"
             records.append(
@@ -1124,6 +1197,38 @@ class MaiLoverPlugin(MaiBotPlugin):
                 }
             )
         return records
+
+    def _build_patrol_status_line(self) -> str:
+        """构造一行运行状态（巡检是否在跑、上次巡检时间、日程来源与节点数）。
+
+        v2.4.3：用于 /mai_diag 的汇总行与"没有记录"时的自诊断——
+        直接区分"巡检没启动（stream_id 未解析）"与"刚启动还没巡检过"。
+        """
+
+        parts: list[str] = []
+        if self._scheduler is not None:
+            try:
+                status = self._scheduler.patrol_status()
+                parts.append(f"巡检={'运行中' if status.get('running') else '未运行'}")
+                if status.get("last_tick_at"):
+                    parts.append(f"上次巡检={status['last_tick_at']}")
+                parts.append(f"间隔={status.get('interval_minutes')}分钟")
+                parts.append(f"stream_id={'已就绪' if status.get('stream_id_ready') else '未解析'}")
+                parts.append(f"主动开关={'开' if status.get('trigger_enabled') else '关'}")
+            except Exception as e:  # noqa: BLE001
+                self.ctx.logger.debug(f"读取巡检状态失败: {e}")
+        if self._schedule_gen is not None:
+            try:
+                mode = "外部日程" if self._schedule_gen.is_external_mode() else "本插件生成"
+                today = datetime.now().strftime("%Y-%m-%d")
+                nodes = len(self._schedule_gen.load_cached_schedule(today))
+                parts.append(f"日程来源={mode}（今日节点 {nodes} 个）")
+            except Exception as e:  # noqa: BLE001
+                self.ctx.logger.debug(f"读取日程状态失败: {e}")
+            ext_status = str(getattr(self._external_src, "last_status", "") or "")
+            if self._schedule_gen.is_external_mode() and ext_status:
+                parts.append(f"外部拉取={ext_status}")
+        return ("状态: " + "｜".join(parts)) if parts else ""
 
     @Command(name="/mai_test", pattern=r"(?<!\S)/mai_test\s*$", description="发送一条测试消息以验证发送通道")
     async def cmd_mai_test(self, **kwargs: Any) -> tuple[bool, str, int]:

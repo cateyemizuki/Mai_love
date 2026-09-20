@@ -89,7 +89,7 @@ class ScheduleGenerator:
         if removed:
             _logger.info(f"已清空本地日程文件: {', '.join(removed)}")
 
-    async def refresh_external_schedule(self, date: str) -> None:
+    async def refresh_external_schedule(self, date: str) -> dict[str, Any]:
         """外部日程模式：拉取最新日程并合并进本地缓存。
 
         快照只含"当前 + 未来"活动，因此采用按 time 合并（union）策略：
@@ -100,28 +100,66 @@ class ScheduleGenerator:
 
         Args:
             date: 日期字符串（YYYY-MM-DD）。
+
+        Returns:
+            v2.4.3 起返回状态字典（供主动行为决策日志记录"外部日程到底读到没有"）：
+            ``{"mode": "internal"|"external", "result": "noop"|"cached"|"fresh"|"empty"
+            |"error"|"exception", "nodes": int, "cached_total": int, "detail": str}``。
         """
         if not self.is_external_mode() or self._external_source is None:
-            return
+            return {
+                "mode": "internal",
+                "result": "noop",
+                "nodes": 0,
+                "cached_total": len(self.load_cached_schedule(date)),
+                "detail": "非外部日程模式（本插件自行生成）",
+            }
 
         try:
             nodes = await self._external_source.get_today_nodes(datetime.now())
         except Exception as e:  # noqa: BLE001
             # 外部源异常不中断巡检其余逻辑，保留旧缓存等下次重试
             _logger.warning(f"读取外部日程异常: {e}")
-            return
+            return {
+                "mode": "external",
+                "result": "exception",
+                "nodes": 0,
+                "cached_total": len(self.load_cached_schedule(date)),
+                "detail": f"读取外部日程异常: {e}",
+            }
+
+        fetch_status = str(getattr(self._external_source, "last_status", "unknown"))
         if nodes is None:
-            return  # 拉取失败：保留旧缓存，等待下次巡检重试
+            return {
+                "mode": "external",
+                "result": "error",
+                "nodes": 0,
+                "cached_total": len(self.load_cached_schedule(date)),
+                "detail": "外部日程拉取失败（对方插件未安装/未启用或 API 报错），保留旧缓存等下次重试",
+            }
 
         if not nodes:
             # 对方今日暂无日程（尚未生成或已清空）：保留旧合并结果，不写入
-            return
+            return {
+                "mode": "external",
+                "result": "empty",
+                "nodes": 0,
+                "cached_total": len(self.load_cached_schedule(date)),
+                "detail": "外部日程返回空（对方今日尚未生成日程或时段无安排），保留旧合并结果",
+            }
 
         merged = {str(n.get("time")): n for n in self.load_cached_schedule(date)}
         for node in nodes:
             merged[str(node.get("time"))] = node
         merged_list = [merged[key] for key in sorted(merged)]
         self._save_cache(date, merged_list)
+        return {
+            "mode": "external",
+            "result": fetch_status if fetch_status in {"cached", "fresh"} else "fresh",
+            "nodes": len(nodes),
+            "cached_total": len(merged_list),
+            "detail": f"外部日程拉到 {len(nodes)} 个节点，合并后共 {len(merged_list)} 个",
+        }
 
     async def generate_daily_schedule(
         self, date: str, personality: str = "", lover_name: str = "麦麦"

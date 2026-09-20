@@ -105,6 +105,23 @@
 - **文档澄清**：「哪个旋钮管哪个触发」对照表见上文「[主动发言节奏](#主动发言节奏哪个旋钮管哪个触发)」。
 - 改动明细见文末「[v2.4.2 改动明细](#v242-改动明细cateye)」。
 
+### 6. v2.4.3 维护改动（cateye）
+
+让决策日志**覆盖所有主动发言行为**，特别是**日程来自外部插件**的情况：
+
+- **新增 `spoken`（确认发言）**：`maisaka.replyer.after_response` 在触发后 90 秒窗口内回执，
+  记录"planner 确实生成并发出去了"，并标注是哪种触发。原来的 `trigger` 只代表"已入队"。
+- **新增 `tool`（Tool 主动发消息）**：planner 通过 `mai_lover_send_message` 主动发消息也进日志。
+- **外部日程拉取结果进日志**（`info`）：`fresh/cached/empty/error/exception` + 今日节点数。
+  外部日程模式下本插件不生成日程，**拉不到节点就永远不会有「日程节点分享」**——
+  以前这件事完全不可见。`fresh`/`cached` 归并为同一状态避免刷屏，失败每次都记。
+- **`/mai_diag` 增加运行状态行**（巡检是否在跑 / 上次巡检时间 / stream_id 是否解析 /
+  日程来源与今日节点数 / 外部拉取状态）；**日志为空时也带这行**，直接区分
+  "巡检没启动（stream_id 没解析）"与"刚加载还没巡检过"。
+
+> 起因：线上执行 `/mai_diag` 得到"最近 3 天没有主动行为决策记录"，却无法判断是刚加载、
+> 还是巡检压根没跑。现在这条提示会直接给出运行状态。
+
 > 上游原有无外部日程开关，所有改动向后兼容：不开启 `use_external_schedule` 时行为与上游完全一致。
 
 ---
@@ -192,7 +209,7 @@ target_qq = 2335260621  # ← 改成你的 QQ 号
 | `/mai_affection <0\|1\|2>` | 调整好感度档位 |
 | `/mai_config` | 查看插件配置摘要 |
 | `/mai_llm_log [天数]` | 查看插件发起的 LLM 调用日志（合并转发，每条请求一条消息） |
-| `/mai_diag [天数]` | 查看**主动行为决策日志**：每轮巡检一条，写明"为什么发言/为什么没发言"（静默、最小间隔、冷却、概率、上限） |
+| `/mai_diag [天数]` | 查看**主动行为决策日志**：每轮巡检一条，写明"为什么发言/为什么没发言"（静默、最小间隔、冷却、概率、上限），并含**确认发言**、**Tool 主动发消息**与**外部日程拉取结果**；汇总行带运行状态（巡检在跑吗 / stream_id 解析了吗 / 日程来源与节点数） |
 | `/mai_help` | 列出所有可用命令 |
 | `/mai_test` | 发送测试消息验证发送通道 |
 
@@ -359,6 +376,20 @@ planner 的 `reason`，planner 据此自主决定说什么（不再是被代码�
 `/mai_diag [天数]` 会合并转发：首条是汇总（触发/跳过次数、跳过原因分布、当前节奏配置），
 其后逐条列出每轮巡检的判定与依据。落盘位置：
 `data/plugins/maibot-community.mai-love/proactive_logs/decisions_YYYY-MM-DD.jsonl`。
+日志里会出现四类记录（v2.4.3 起覆盖全部主动发言行为）：
+
+| 类型 | 含义 |
+|---|---|
+| ✅ `trigger` | 插件发起了一次主动触发（已入队，等 planner 决定说什么） |
+| 🗣️ `spoken` | planner **确认生成并发送**了回复（触发后 90 秒内的回执），并标注触发类型 |
+| ⏭️ `skip` | 这一轮没触发，附原因（静默 / 最小间隔 / 冷却 / 概率 / 额度 …） |
+| ℹ️ `info` | 运行信息，目前是外部日程拉取结果（`external_schedule_*`，含今日节点数） |
+
+> **外部日程模式**（`schedule.use_external_schedule = true`）下本插件不生成日程，
+> 「日程节点分享」完全取决于能否从自主规划插件读到节点。拉取结果会以 `info` 记录
+> （`fresh` / `cached` / `empty` / `error` / `exception`），一次都读不到时可直接看到原因。
+> 汇总行还会给出运行状态：巡检是否在跑、上次巡检时间、`stream_id` 是否解析、
+> 日程来源与今日节点数——**日志为空时也会附带这一行**，用来区分"没启动"与"刚启动"。
 
 ---
 
@@ -513,6 +544,17 @@ A: 正常。主动私聊**不调用插件的 LLM**——插件只把 `intent`/`r
 A: `/mai_diag [天数]`：每轮巡检一条，写明被哪个旋钮挡住（静默 / 最小间隔 / 冷却 / 概率 / 上限 /
 想念时长不满足 / LLM 把关驳回等），以及当时的间隔与预算数值。
 若只想知道"发过几次"，看首条汇总即可。
+**Q: `/mai_diag` 说"没有记录"，是坏了吗？**
+A: 通常是刚加载（第一轮巡检立刻跑，之后每 10 分钟一轮）。现在这条提示会**附带运行状态**：
+「巡检=未运行」说明 `stream_id` 没解析出来（检查 `target_qq` 是否填对、适配器是否连上、
+与目标用户的私聊流是否存在），此时主动发言整条链路都没跑；
+「巡检=运行中」+「上次巡检=…」则说明日志在写，等下一轮再看即可。
+
+**Q: 开了外部日程后，麦麦从来不分享日程节点？**
+A: 外部日程模式下本插件不生成日程，节点完全来自「自主规划插件」的 API。
+用 `/mai_diag` 看 `external_schedule_*` 记录：`empty` = 对方今日没有日程（或该时段无安排）；
+`error` / `exception` = 对方插件未安装/未启用/API 报错（`detail` 里有原因）。
+正常时汇总行会显示「日程来源=外部日程（今日节点 N 个）」。
 
 ---
 
@@ -626,6 +668,51 @@ README 新增「[主动发言节奏：哪个旋钮管哪个触发](#主动发言
   静默 fail-safe（非法静默/非法早晚安窗口/告警节流）、决策日志本体（字段、record_skips、
   按天落盘、过期清理）、`reset_daily` 保留 `last_speak_time`、入队失败如实记录。
 - 回归：插件自带 76 项 + v2.4.1 补丁 23 项，全部通过。
+
+---
+
+## v2.4.3 改动明细（cateye）
+
+本节是上文「Fork 改动说明」第 6 项的详细版。
+
+### 1. 决策日志覆盖"所有主动发言行为"
+
+| 事件 | 来源 | 为什么需要 |
+|---|---|---|
+| `trigger`（v2.4.2） | `Scheduler._tick` 各门控 | 只代表"已入队"，不代表真的说出口 |
+| `spoken`（新） | `maisaka.replyer.after_response` 的 90 秒窗口回执 | 确认 planner **真的生成并发送**了，并标注触发类型（`plugin.py` `on_replyer_after_response`） |
+| `tool`（新） | `mai_lover_send_message` Tool 发送成功 | 这条路径不走巡检，此前完全不在日志里 |
+| `info`（新） | `Scheduler._log_external_schedule_status` | 外部日程模式下不生成日程，读不到节点就永远没有「日程节点分享」 |
+
+`decision_logger` 相应新增 `ACTION_SPOKEN` / `ACTION_INFO`；`record_skips=false` 只影响 `skip`。
+
+### 2. 外部日程状态可见
+
+- `ExternalScheduleSource` 新增 `last_status` / `last_node_count`
+  （`unavailable` / `cached` / `fresh` / `empty` / `error`），在 `get_today_nodes` 内更新。
+- `ScheduleGenerator.refresh_external_schedule` 由返回 `None` 改为返回状态字典
+  （`mode` / `result` / `nodes` / `cached_total` / `detail`；非外部模式 `internal/noop`）。
+- `Scheduler._log_external_schedule_status` 只在**状态或节点数变化**时记一条 `info`，
+  但 `empty` / `error` / `exception` **每次都记**。
+  其中 `fresh` 与 `cached` 必须归并为同一状态：2 分钟 TTL + 10 分钟巡检会让两者每轮交替，
+  否则会变成 144 行/天的噪声（这一点在测试里专门加了用例）。
+
+### 3. `/mai_diag` 自诊断
+
+- `Scheduler` 新增 `patrol_status()` / `is_patrolling` / `get_last_trigger_intent()`；
+  巡检任务句柄现在被保存（`start()` 与 `start_patrol()` 两处），用来回答"巡检到底在不在跑"。
+- `plugin.py` 新增 `_build_patrol_status_line()`：巡检状态 / 上次巡检时间 / 间隔 /
+  `stream_id` 是否解析 / 主动开关 / 日程来源与今日节点数 / 外部拉取状态。
+  它同时用于**汇总行**与**空日志提示**——这正是本次改动的起因：
+  线上拿到"最近 3 天没有主动行为决策记录"却无法判断是刚加载还是巡检没跑。
+
+### 验证
+
+- `test_mailove_v243.py`（测试区）：**37 项通过** —— 外部日程五种状态（fresh/cached/empty/
+  error/exception，含 API 异常折叠为 error 与调度器侧 exception 兜底）、状态变化才记日志、
+  失败每次都记、`spoken` 回执（含超窗口不记）、Tool 主动发消息进日志、
+  `/mai_diag` 四类计数与自诊断行、空日志提示附带状态行。
+- 回归：v2.4.2 用例 38 项 + v2.4.1 补丁 23 项 + 插件自带 76 项，全部通过。
 
 ---
 

@@ -48,7 +48,7 @@ def _schema_i18n(
 # 插件总开关
 # ---------------------------------------------------------------------------
 
-CONFIG_SCHEMA_VERSION = "2.4.2"
+CONFIG_SCHEMA_VERSION = "2.4.3"
 
 
 class PluginConfig(PluginConfigBase):
