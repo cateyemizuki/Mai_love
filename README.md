@@ -82,6 +82,29 @@
   不要回复/引用你自己发送的消息、优先回应对方最后一条发言、`reply` 的 `msg_id` 只能选对方的消息。
 - 改动明细（含宿主源码位置与验证方式）见文末「[v2.4.1 改动明细](#v241-改动明细cateye)」。
 
+### 5. v2.4.2 维护改动（cateye）
+
+针对"配置了间隔却依然频繁主动发言""触发过却没有日志"两个真实困惑：
+
+- **新增「主动发言最小间隔」**（`schedule.min_trigger_interval_minutes`，**默认 240 = 至少间隔 4 小时**，填 0 关闭）：
+  对所有主动触发（**含早安/晚安**）生效的硬性间隔，0~1440 分钟。
+  此前想做"至少 4 小时才主动说一次"是**做不到**的——唯一的间隔旋钮
+  `user_cooldown_minutes` 被校验器硬夹在 **0~60**，早安晚安还会无视它；
+  `miss_trigger_hours_min` 又只管「想念」这一种触发（且每天最多一次）。
+  另加 `min_interval_exempt_greetings` 决定早晚安是否豁免该间隔。
+- **新增「主动行为决策日志」+ `/mai_diag` 命令**：每轮巡检记录一条判定结论
+  （是否静默、距上次发言多久、最小间隔/冷却是否通过、概率掷点、预算余量、最终动作与原因），
+  跳过原因按优先级只保留最相关的那条（避免"早安被最小间隔挡住"被"日常巡检没掷中"覆盖）。
+  落盘在 `data/plugins/maibot-community.mai-love/proactive_logs/`。
+  **主动私聊本身不调用插件的 LLM**，所以它不会出现在 LLM 调用日志里——这是此前"触发过却没日志"的原因。
+- **静默时段不再静默失效**：时间窗口配置写成非 `HH:MM` 格式时，原来会**静默地**当成"不在静默期"
+  （等于静默失效且无任何提示）。现在记 warning，并 fail-safe：静默时段视为"在静默中"（宁可不发）、
+  早晚安窗口视为"不在窗口内"（不误发）。
+- **跨午夜不再丢间隔**：`reset_daily` 不再清空 `last_speak_time`（清空会让 23:58 刚发过、
+  00:08 又能发）。
+- **文档澄清**：「哪个旋钮管哪个触发」对照表见上文「[主动发言节奏](#主动发言节奏哪个旋钮管哪个触发)」。
+- 改动明细见文末「[v2.4.2 改动明细](#v242-改动明细cateye)」。
+
 > 上游原有无外部日程开关，所有改动向后兼容：不开启 `use_external_schedule` 时行为与上游完全一致。
 
 ---
@@ -169,6 +192,7 @@ target_qq = 2335260621  # ← 改成你的 QQ 号
 | `/mai_affection <0\|1\|2>` | 调整好感度档位 |
 | `/mai_config` | 查看插件配置摘要 |
 | `/mai_llm_log [天数]` | 查看插件发起的 LLM 调用日志（合并转发，每条请求一条消息） |
+| `/mai_diag [天数]` | 查看**主动行为决策日志**：每轮巡检一条，写明"为什么发言/为什么没发言"（静默、最小间隔、冷却、概率、上限） |
 | `/mai_help` | 列出所有可用命令 |
 | `/mai_test` | 发送测试消息验证发送通道 |
 
@@ -212,11 +236,35 @@ target_qq = 2335260621  # ← 改成你的 QQ 号
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `schedule.generate_hour` | 3 | 每天几点生成日程 (0-23) |
-| `schedule.check_interval_minutes` | 5 | 巡检间隔（分钟） |
-| `schedule.daily_max_speak` | 5 | 每日主动触发上限 |
-| `schedule.user_cooldown_minutes` | 5 | 用户发言后冷却（分钟） |
+| `schedule.check_interval_minutes` | 10 | 巡检间隔（分钟） |
+| `schedule.daily_max_speak` | 5 | 每日主动触发上限（含早晚安；0 = 完全静音） |
+| `schedule.user_cooldown_minutes` | 30 | 用户发言后冷却（分钟，**上限 60**） |
+| `schedule.min_trigger_interval_minutes` | **240** | **主动发言最小间隔（分钟，0~1440）**：任意两次主动发言之间的硬性间隔，默认对所有主动触发生效。默认 240 = 至少间隔 4 小时；填 `0` 关闭 |
+| `schedule.min_interval_exempt_greetings` | false | 早安/晚安是否豁免上面的最小间隔 |
 | `schedule.proactive_trigger_enabled` | true | 麦麦会不会主动找你 |
 | `schedule.use_external_schedule` | false | 使用外部日程：读取自主规划插件，本插件清空缓存且不再生成 |
+
+### 主动发言节奏：哪个旋钮管哪个触发
+
+最容易踩的坑是**把「想念触发下限」当成主动发言的整体间隔**——它只管「想念」这一种触发。
+实际生效关系如下：
+
+| 触发 | 什么时候触发 | 受哪些旋钮限制 |
+|------|--------------|----------------|
+| **S级 早安 / 晚安** | 进入 `morning_*` / `night_*` 窗口且当天没发过 | 静默时段、`min_trigger_interval_minutes`（可用 `min_interval_exempt_greetings` 豁免）、`daily_max_speak`。**无视「用户冷却」与概率** |
+| **A级 想念** | **用户**沉默 > 区间内随机阈值（`miss_trigger_hours_min`~`max`，每天最多 1 次） | 静默、最小间隔、用户冷却、概率 `miss_speak_rate`、上限、未来 2h 有日程则不打扰、LLM 把关 |
+| **B级 日程节点分享** | 当前时间命中日程节点 | 静默、最小间隔、用户冷却、概率 `activity_trigger_rate`、上限 |
+| **B级 日常巡检** | 每轮巡检掷点 | 静默、最小间隔、用户冷却、概率 `default_speak_rate`、上限 |
+
+结论（想调"多久主动找我一次"）：
+
+- **整体间隔** → `schedule.min_trigger_interval_minutes`（默认 240 分钟 = 4 小时，对所有触发生效，含早晚安）。
+- **你刚说完话后的安静期** → 改 `schedule.user_cooldown_minutes`（**最大 60 分钟**，早安晚安不受它管）。
+- **想念的沉默门槛** → 改 `time_windows.miss_trigger_hours_min/max`（**只影响想念，且每天最多一次**）。
+- **每天最多几次** → 改 `schedule.daily_max_speak`。
+- **完全不想被打扰的时段** → 改 `time_windows.silence_start/silence_end`。
+
+判定过程可查：`/mai_diag`（每轮巡检一条，写明被哪个旋钮挡住）。
 
 ### 概率设置
 | 参数 | 默认值 | 说明 |
@@ -232,8 +280,8 @@ target_qq = 2335260621  # ← 改成你的 QQ 号
 | `time_windows.morning_end` | 09:00 | 早安窗口结束 |
 | `time_windows.night_start` | 22:00 | 晚安窗口开始 |
 | `time_windows.night_end` | 23:59 | 晚安窗口结束 |
-| `time_windows.miss_trigger_hours_min` | 4.0 | 想念触发区间下限（小时）：沉默不足绝不触发 |
-| `time_windows.miss_trigger_hours_max` | 8.0 | 想念触发区间上限（小时）：沉默超过后时长条件必满足 |
+| `time_windows.miss_trigger_hours_min` | 4.0 | 【**仅对想念生效**】想念触发区间下限（小时）：**用户**沉默不足绝不触发。它不是主动发言的整体间隔——整体间隔看 `schedule.min_trigger_interval_minutes` |
+| `time_windows.miss_trigger_hours_max` | 8.0 | 【仅对想念生效】想念触发区间上限（小时）：沉默超过后时长条件必满足 |
 | `time_windows.miss_llm_check_enabled` | true | 想念触发前 LLM 把关（不自然则驳回，30 分钟后重试） |
 | `time_windows.miss_reason_prompt` | （见下） | 想念触发时传给 planner 的提示词 |
 | `time_windows.miss_confirm_prompt` | （见下） | LLM 把关提示词模板（Y 放行 / N 驳回） |
@@ -296,6 +344,21 @@ planner 的 `reason`，planner 据此自主决定说什么（不再是被代码�
 可看到每次驳回的原始回复）、`tool_send_message`（Tool 生成消息）、
 `cateye_screen_describe`（屏幕理解）。用 `/mai_llm_log [天数]` 通过合并转发查看，
 每次请求一条消息（标注时间、事件、模型与成功状态）。
+
+### 主动行为日志（v2.4.2）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `proactive_log.enabled` | true | 记录每轮巡检的判定结论（静默/最小间隔/冷却/概率/上限/最终动作） |
+| `proactive_log.record_skips` | true | 是否连"这一轮没发言"也记（关掉就只能看到发言记录，查不出"为什么没发"） |
+| `proactive_log.retention_days` | 3 | 日志保留天数，过期自动清理 |
+
+**为什么需要它**：主动私聊本身**不调用插件的 LLM**——插件只是把 `intent`/`reason`
+文本交给宿主 `maisaka.proactive.trigger`，真正的 planner/replyer 调用由宿主发起。
+所以「今天主动找过我」这件事**不会出现在 [LLM 调用日志] 里**，只会出现在本日志与宿主主日志中。
+`/mai_diag [天数]` 会合并转发：首条是汇总（触发/跳过次数、跳过原因分布、当前节奏配置），
+其后逐条列出每轮巡检的判定与依据。落盘位置：
+`data/plugins/maibot-community.mai-love/proactive_logs/decisions_YYYY-MM-DD.jsonl`。
 
 ---
 
@@ -366,6 +429,8 @@ mai_lover/
 ├── affection_manager.py   # 好感度管理
 ├── memory_manager.py      # 记忆管理（预留）
 ├── llm_service.py         # LLM 调用封装
+├── llm_logger.py          # LLM 调用日志（v2.4.0）
+├── decision_logger.py     # 主动行为决策日志（v2.4.2）
 ├── message_service.py     # 消息发送 + 情绪后缀
 ├── holiday_service.py     # 节假日 API
 ├── schedule_generator.py  # 日程生成 + 活动查询
@@ -374,6 +439,10 @@ mai_lover/
 ├── data/                  # 运行时数据目录（好感度/日程缓存，自动生成）
 └── README.md              # 本文件
 ```
+
+> 数据目录（`ctx.paths.data_dir`，即 `data/plugins/maibot-community.mai-love/`）下会生成：
+> `affection_memory.json`（好感度与当日计数）、`schedule_cache.json`（日程缓存）、
+> `llm_logs/`（LLM 调用日志）、`proactive_logs/`（主动行为决策日志）。
 
 ---
 
@@ -427,6 +496,24 @@ A: 需要 `cateye.enabled = true` 且同时安装「cateye 统一连接插件」
 **Q: 为什么想看 LLM 日志却提示未启用？**
 A: 检查 `[llm_log] enabled` 是否为 true；日志只记录插件自己发起的调用（日程生成/想念把关/Tool 消息/屏幕理解），planner 日常聊天回复由宿主产生，不在记录范围。
 
+**Q: 我明明配置了"至少 4 小时"，为什么麦麦还是每隔半小时就主动找我？**
+A: 因为那个 4 小时是 `time_windows.miss_trigger_hours_min`，它**只管「想念」这一种触发**
+（条件是"**你**沉默 4~8 小时"，且每天最多一次），不是主动发言的整体间隔。
+真正决定整体节奏的是 `schedule.user_cooldown_minutes`（默认 30 分钟，**上限 60**）与
+`schedule.daily_max_speak`，而早安/晚安连冷却都会无视。
+想让"至少 4 小时才主动说一次"，v2.4.2 起直接填
+`schedule.min_trigger_interval_minutes`（**v2.4.2 起默认就是 240**）；对照表见「主动发言节奏」一节。
+
+**Q: 今天麦麦主动找过我了，为什么 LLM 日志里没有？**
+A: 正常。主动私聊**不调用插件的 LLM**——插件只把 `intent`/`reason` 交给宿主
+`maisaka.proactive.trigger`，真正的 planner/replyer 由宿主发起、记在宿主自己的日志里。
+主动行为本身请用 `/mai_diag` 查看（v2.4.2 起）。
+
+**Q: 怎么查"这一轮为什么没发"？**
+A: `/mai_diag [天数]`：每轮巡检一条，写明被哪个旋钮挡住（静默 / 最小间隔 / 冷却 / 概率 / 上限 /
+想念时长不满足 / LLM 把关驳回等），以及当时的间隔与预算数值。
+若只想知道"发过几次"，看首条汇总即可。
+
 ---
 
 ## v2.4.1 改动明细（cateye）
@@ -470,6 +557,75 @@ A: 检查 `[llm_log] enabled` 是否为 true；日志只记录插件自己发起
 > 这是**软约束**（宿主没有强制目标的参数）。要真正"目标可控"，需要给
 > `maisaka.proactive.trigger` 加一个可选 `reply_target_msg_id` 并让框架写进注入文本或作为
 > `reply` 工具默认参数——那属于改宿主核心。
+
+---
+
+## v2.4.2 改动明细（cateye）
+
+本节是上文「Fork 改动说明」第 5 项的详细版（含源码位置与验证方式）。
+
+### 1. 主动发言最小间隔（`schedule.min_trigger_interval_minutes`）
+
+**为什么需要**：v2.4.2 之前，想把主动发言拉成"至少 4 小时一次"是**做不到**的——
+
+| 旋钮 | 真实作用域 | 上限 |
+|---|---|---|
+| `schedule.user_cooldown_minutes` | 只压住 B级（日程节点/日常巡检），早晚安无视 | 校验器 `_normalize_cooldown` 硬夹 **0~60**，填 240 会被静默收敛成 60 |
+| `time_windows.miss_trigger_hours_min/max` | 只管 A级「想念」（且每天最多 1 次） | — |
+| `schedule.daily_max_speak` | 管每天总量，不管间隔 | — |
+
+**改动**：`config.py` 新增 `min_trigger_interval_minutes`（0~1440，**默认 240**）与
+`min_interval_exempt_greetings`（早晚安是否豁免）；`scheduler.py` 的 `_tick` 在静默检查之后、
+所有触发之前统一计算 `interval_blocked`（基准取 `affection.last_speak_time()`，
+由每次成功触发经由 `increment_speak()` 刷新），S级/A级/B级 各分支分别按是否豁免判定。
+
+### 2. 主动行为决策日志 + `/mai_diag`
+
+**为什么需要**：主动私聊不调用插件的 LLM（只把 `intent`/`reason` 交给宿主
+`maisaka.proactive.trigger`），所以"今天主动找过我"永远不会出现在 LLM 调用日志里；
+而宿主主日志里也只有孤零零一行 `B级触发: 日常巡检`，看不出是被概率放过还是冷却已过。
+
+**改动**：新增 `decision_logger.py`（`ProactiveDecisionLogger`，对齐 `llm_logger.py` 的
+按天 JSONL + 过期清理约定），落盘 `proactive_logs/decisions_YYYY-MM-DD.jsonl`；
+`Scheduler._tick` 每轮写**恰好一条**（`mark_trigger` / `mark_skip`），
+新增 `plugin.py` 的 `/mai_diag [天数]` 命令（合并转发，含汇总行）；
+`config.py` 新增 `[proactive_log]` 节（`enabled` / `record_skips` / `retention_days`）。
+
+**一个设计细节**：一轮巡检里可能有多个候选触发都被挡住，若让后写的覆盖先写的，
+就会出现"你问早安为什么没发、日志却报日常巡检掷点没中"。因此
+`SKIP_PRIORITY` 给每个跳过原因定了优先级，只保留最相关的那条
+（同时记录 `minutes_since_last_speak` / `min_interval_minutes` / `cooldown_minutes` /
+`budget_used` / `budget_limit` 等数值便于对账）。
+
+### 3. 静默窗口 fail-safe 与告警
+
+**问题**：`_is_in_time_window` 解析失败时返回 `False`（= 不在窗口内），
+于是**时间格式写错会让静默时段静默失效**，且没有任何提示。
+
+**改动**：`_is_in_time_window` 增加 keyword-only 参数 `invalid_result`
+（保持静态方法与既有调用/测试兼容）；`_tick` 通过 `_collect_invalid_time_keys()`
+对 6 个时间配置项做校验，非法值记 warning（同一个值只告警一次），
+并按 fail-safe 处理：**静默时段传 `invalid_result=True`**（视为静默，宁可不发）、
+早晚安窗口保持默认 `False`（不触发）。
+
+### 4. 跨午夜不再丢间隔
+
+`affection_manager.reset_daily()` 原本会把 `last_speak_time` 清空，导致每天 0 点后
+"距上次发言"的约束消失（23:58 刚发过、00:08 又能发）。现已不再清空该字段
+（`today_speak_count` 与当日早晚安/想念标记仍照常重置）。
+
+### 5. 文档澄清
+
+README 新增「[主动发言节奏：哪个旋钮管哪个触发](#主动发言节奏哪个旋钮管哪个触发)」对照表，
+并在配置项描述里标注 `miss_trigger_hours_*`「仅对想念生效」、
+`user_cooldown_minutes` 的 60 分钟上限；WebUI 文案同步（含 en/ja 翻译）。
+
+### 验证
+
+- `test_mailove_v242.py`（测试区）：**35 项通过** —— 最小间隔门控（含豁免开关与关闭状态）、
+  静默 fail-safe（非法静默/非法早晚安窗口/告警节流）、决策日志本体（字段、record_skips、
+  按天落盘、过期清理）、`reset_daily` 保留 `last_speak_time`、入队失败如实记录。
+- 回归：插件自带 76 项 + v2.4.1 补丁 23 项，全部通过。
 
 ---
 

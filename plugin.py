@@ -28,6 +28,7 @@ from .affection_manager import AffectionManager
 from .cateye_client import CateyeClient
 from .config import MaiLoverPluginSettings
 from .constants import AFFECTION_DESCRIPTIONS
+from .decision_logger import ProactiveDecisionLogger
 from .external_schedule import ExternalScheduleSource
 from .holiday_service import HolidayService
 from .llm_logger import LLMCallLogger
@@ -56,6 +57,26 @@ _PROACTIVE_RULE_WINDOW_SECONDS = 90.0
 #: 省略图片时替换成的文本占位符（不能直接删 part，否则 item 可能没有 part）。
 _IMAGE_OMITTED_PLACEHOLDER = "[图片已省略：为控制上下文体积]"
 
+#: 主动行为决策日志里的跳过原因 → 中文说明（/mai_diag 展示用）。
+#: 原因键由 ``Scheduler._tick`` 写入；这里只做人类可读映射，未知键会原样显示。
+_DIAG_REASON_LABELS: dict[str, str] = {
+    "no_candidate": "本轮没有满足条件的触发",
+    "silence": "处于静默时段",
+    "invalid_time_config": "时间配置非法，按 fail-safe 处理",
+    "min_interval": "未到主动发言最小间隔",
+    "cooldown": "处于用户冷却期",
+    "budget": "当日发言上限已用完",
+    "dice": "概率未通过",
+    "already_sent_today": "今天已经发过（每天一次）",
+    "no_user_message": "还没有用户消息记录",
+    "miss_duration": "想念时长条件未满足",
+    "future_schedule": "未来 2 小时内有日程节点",
+    "llm_rejected": "想念把关被 LLM 驳回",
+    "planner_trigger_failed": "触发未入队（stream_id 缺失或开关关闭）",
+    "disabled": "主动触发开关已关闭",
+    "daily_max_zero": "每日发言上限为 0",
+}
+
 
 class MaiLoverPlugin(MaiBotPlugin):
     """麦麦恋人插件主类。
@@ -82,6 +103,8 @@ class MaiLoverPlugin(MaiBotPlugin):
         self._memory_mgr: Optional[MemoryManager] = None
         self._llm_svc: Optional[LLMService] = None
         self._llm_logger: Optional[LLMCallLogger] = None
+        # 主动行为决策日志（v2.4.2）：记录每轮巡检的判定结论，供 /mai_diag 查看
+        self._decision_logger: Optional[ProactiveDecisionLogger] = None
         self._cateye: Optional[CateyeClient] = None
         self._message_svc: Optional[MessageService] = None
         self._holiday_svc: Optional[HolidayService] = None
@@ -122,6 +145,15 @@ class MaiLoverPlugin(MaiBotPlugin):
             retention_days=self.config.llm_log.retention_days,
         )
         self._llm_logger.cleanup()
+        # 主动行为决策日志（v2.4.2）：主动私聊本身不调用插件的 LLM，所以
+        # "为什么又发了 / 今天怎么没发"只能靠这份日志回答（见 decision_logger 模块说明）
+        self._decision_logger = ProactiveDecisionLogger(
+            data_dir,
+            enabled=self.config.proactive_log.enabled,
+            retention_days=self.config.proactive_log.retention_days,
+            record_skips=self.config.proactive_log.record_skips,
+        )
+        self._decision_logger.cleanup()
         self._llm_svc = LLMService(self.ctx, self.config, call_logger=self._llm_logger)
         lover_name = self._get_lover_name()
         self._message_svc = MessageService(
@@ -140,11 +172,13 @@ class MaiLoverPlugin(MaiBotPlugin):
 
         # 创建调度器（v2.0.0: 仅 4 个依赖，不再传 message_svc/memory_mgr；
         # v2.3.0: 传入 LLM 服务供想念触发前的 LLM 把关使用；
-        # v2.4.0: 传入恋人电脑客户端供触发时查看电脑状态）
+        # v2.4.0: 传入恋人电脑客户端供触发时查看电脑状态；
+        # v2.4.2: 传入主动行为决策日志）
         self._scheduler = Scheduler(
             self.ctx, self.config, self._affection_mgr, self._schedule_gen,
             llm_service=self._llm_svc,
             cateye_client=self._cateye,
+            decision_logger=self._decision_logger,
         )
         self._scheduler.set_personality(self._cached_personality)
         if lover_name:
@@ -220,6 +254,12 @@ class MaiLoverPlugin(MaiBotPlugin):
                 self.config.llm_log.enabled,
                 self.config.llm_log.retention_days,
             )
+        if self._decision_logger is not None:
+            self._decision_logger.update_settings(
+                self.config.proactive_log.enabled,
+                self.config.proactive_log.retention_days,
+                self.config.proactive_log.record_skips,
+            )
 
         # 停止旧调度器并重建实例（v2.3.1：复用同一实例时，旧循环若正卡在
         # tick 中，start() 清除 stop_event 后会与新循环并存，形成双循环竞态）
@@ -230,6 +270,7 @@ class MaiLoverPlugin(MaiBotPlugin):
                 self.ctx, self.config, self._affection_mgr, self._schedule_gen,
                 llm_service=self._llm_svc,
                 cateye_client=self._cateye,
+                decision_logger=self._decision_logger,
             )
             self._scheduler.set_personality(self._cached_personality)
             lover_name = self._get_lover_name()
@@ -789,6 +830,7 @@ class MaiLoverPlugin(MaiBotPlugin):
             "/mai_affection — 调整好感度档位: /mai_affection <0|1|2>\n"
             "/mai_config    — 查看当前插件配置摘要\n"
             "/mai_llm_log   — 查看 LLM 调用日志: /mai_llm_log [天数]\n"
+            "/mai_diag      — 查看主动行为决策日志（为什么发言/为什么没发言）: /mai_diag [天数]\n"
             "/mai_test      — 发送一条测试消息（验证发送通道）"
         )
         try:
@@ -937,6 +979,147 @@ class MaiLoverPlugin(MaiBotPlugin):
                 {
                     "user_id": "0",
                     "nickname": "LLM调用日志",
+                    "segments": [{"type": "text", "content": line}],
+                }
+            )
+        return records
+
+    @Command(
+        name="/mai_diag",
+        pattern=r"(?<!\S)/mai_diag(?:\s+(?P<mai_days>\S+))?\s*$",
+        description="查看主动行为决策日志（每轮巡检一条：为什么发言/为什么没发言）。用法: /mai_diag [天数]",
+    )
+    async def cmd_mai_diag(
+        self, mai_days: str = "", **kwargs: Any
+    ) -> tuple[bool, str, int]:
+        """查看主动行为决策日志：每轮巡检一条记录，合并转发发出。
+
+        v2.4.2 新增。用于回答"明明配置了间隔，为什么还是发了""今天怎么一次都没发"——
+        决策日志会逐轮给出判定依据（静默/最小间隔/冷却/概率/上限）与最终动作。
+        """
+        if not self._authorize_command(kwargs):
+            return True, "没有权限", 2
+        stream_id = str(kwargs.get("stream_id", ""))
+
+        if self._decision_logger is None or not self._decision_logger.enabled:
+            msg = "主动行为日志未启用（配置 [proactive_log] enabled = true 后开始记录）。"
+            try:
+                await self.ctx.send.text(text=msg, stream_id=stream_id)
+            except Exception as e:
+                self.ctx.logger.error(f"cmd_mai_diag 提示发送失败: {e}")
+            return True, "日志未启用", 2
+
+        days: Optional[int] = None
+        if mai_days:
+            try:
+                days = max(1, min(30, int(str(mai_days).strip())))
+            except ValueError:
+                days = None
+
+        entries = self._decision_logger.read_entries(days)
+        if not entries:
+            msg = (
+                f"最近 {days or self._decision_logger.retention_days} 天没有主动行为决策记录。"
+                "（插件刚加载或日志刚开启时属正常）"
+            )
+            try:
+                await self.ctx.send.text(text=msg, stream_id=stream_id)
+            except Exception as e:
+                self.ctx.logger.error(f"cmd_mai_diag 空提示发送失败: {e}")
+            return True, "暂无日志", 2
+
+        records = self._build_diag_records(
+            entries, self._decision_logger.retention_days
+        )
+        try:
+            await self.ctx.send.forward(records, stream_id)
+            return True, "决策日志已合并转发", 2
+        except Exception as forward_exc:
+            # 适配器不支持转发时回退为纯文本
+            self.ctx.logger.warning(f"决策日志合并转发失败，回退纯文本: {forward_exc}")
+            fallback = "\n\n".join(
+                str(record["segments"][0]["content"]) for record in records
+            )
+            try:
+                await self.ctx.send.text(text=fallback, stream_id=stream_id)
+                return True, "决策日志已发送（文本回退）", 2
+            except Exception as e:
+                self.ctx.logger.error(f"cmd_mai_diag 回退发送失败: {e}")
+                return False, f"发送失败: {e}", 2
+
+    def _build_diag_records(
+        self, entries: list[dict[str, Any]], retention_days: int
+    ) -> list[dict[str, Any]]:
+        """把决策日志条目构造成合并转发节点。
+
+        首条为汇总（时间范围、触发/跳过计数、跳过原因分布、当前节奏配置），
+        其后按时间升序逐条展示；最多展示最近 30 条。
+        """
+        max_records = 30
+        total = len(entries)
+        shown = entries[-max_records:]
+        triggered = sum(1 for e in entries if str(e.get("action")) == "trigger")
+        skipped = total - triggered
+
+        reason_counts: dict[str, int] = {}
+        for entry in entries:
+            if str(entry.get("action")) == "trigger":
+                continue
+            key = str(entry.get("reason") or "unknown")
+            reason_counts[key] = reason_counts.get(key, 0) + 1
+        top_reasons = sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:6]
+
+        schedule_cfg = self.config.schedule
+        windows = self.config.time_windows
+        header = (
+            "🔍 麦麦恋人 主动行为决策日志\n"
+            f"时间范围: {entries[0].get('time', '?')} ~ {entries[-1].get('time', '?')}\n"
+            f"共 {total} 轮巡检：发言 {triggered} 次 / 跳过 {skipped} 次"
+            f"（展示最近 {len(shown)} 条，保留 {retention_days} 天）\n"
+            f"跳过原因: {', '.join(f'{k}×{v}' for k, v in top_reasons) if top_reasons else '无'}\n"
+            f"当前节奏: 最小间隔 {schedule_cfg.min_trigger_interval_minutes} 分钟"
+            f"（早晚安{'豁免' if schedule_cfg.min_interval_exempt_greetings else '不豁免'}）"
+            f" | 用户冷却 {schedule_cfg.user_cooldown_minutes} 分钟"
+            f" | 每日上限 {schedule_cfg.daily_max_speak}"
+            f" | 静默 {windows.silence_start}-{windows.silence_end}"
+        )
+        records: list[dict[str, Any]] = [
+            {
+                "user_id": "0",
+                "nickname": "主动行为日志",
+                "segments": [{"type": "text", "content": header}],
+            }
+        ]
+
+        for entry in shown:
+            action = str(entry.get("action") or "")
+            trigger_type = str(entry.get("trigger_type") or "")
+            if action == "trigger":
+                line = (
+                    f"[{entry.get('time', '?')}] ✅ 发言 · {trigger_type or '?'}\n"
+                    f"{entry.get('detail') or ''}"
+                )
+            else:
+                reason = str(entry.get("reason") or "unknown")
+                label = _DIAG_REASON_LABELS.get(reason, reason)
+                line = (
+                    f"[{entry.get('time', '?')}] ⏭️ 跳过 · {reason}（{label}）\n"
+                    f"{entry.get('detail') or ''}"
+                )
+            extras: list[str] = []
+            minutes_since = entry.get("minutes_since_last_speak")
+            if minutes_since is not None:
+                extras.append(f"距上次发言 {minutes_since} 分钟")
+            if entry.get("budget_used") is not None:
+                extras.append(f"预算 {entry.get('budget_used')}/{entry.get('budget_limit', '?')}")
+            if entry.get("min_interval_minutes"):
+                extras.append(f"最小间隔 {entry.get('min_interval_minutes')} 分钟")
+            if extras:
+                line += "\n（" + "，".join(extras) + "）"
+            records.append(
+                {
+                    "user_id": "0",
+                    "nickname": "主动行为日志",
                     "segments": [{"type": "text", "content": line}],
                 }
             )

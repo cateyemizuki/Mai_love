@@ -48,7 +48,7 @@ def _schema_i18n(
 # 插件总开关
 # ---------------------------------------------------------------------------
 
-CONFIG_SCHEMA_VERSION = "2.4.1"
+CONFIG_SCHEMA_VERSION = "2.4.2"
 
 
 class PluginConfig(PluginConfigBase):
@@ -229,17 +229,62 @@ class ScheduleConfig(PluginConfigBase):
     )
     user_cooldown_minutes: int = Field(
         default=30,
-        description="你刚发完消息后，麦麦多久之内不会主动找你。比如你刚说了句话，如果设为 30 分钟，这 30 分钟内麦麦不会突然蹦出来打扰你。早安晚安不受此限制。",
+        ge=0,
+        le=60,
+        description="你刚发完消息后，麦麦多久之内不会主动找你。比如你刚说了句话，如果设为 30 分钟，这 30 分钟内麦麦不会突然蹦出来打扰你。"
+                    "早安晚安不受此限制。注意：本项上限 60 分钟（超出会被自动收敛），且只压住「日程节点/日常巡检」；"
+                    "想要更长的整体主动发言间隔请用上面的「主动发言最小间隔」。",
         json_schema_extra={
-            "hint": "冷却期（分钟）。你刚发完消息后麦麦会闭嘴这多久。避免「刚说完就又来」的骚扰感。早安晚安无视冷却。",
+            "hint": "冷却期（分钟，0~60）。你刚发完消息后麦麦会闭嘴这多久，避免「刚说完就又来」的骚扰感。"
+                    "早安晚安无视冷却；想限整体间隔用「主动发言最小间隔」。",
             "i18n": _schema_i18n(
                 label_en="User Cooldown (min)",
                 label_ja="ユーザークールダウン（分）",
-                hint_en="After you send a message, MaiMai stays quiet for this many minutes to avoid feeling intrusive. Morning/night greetings ignore cooldown.",
-                hint_ja="あなたがメッセージを送った後、麦麦がこの分数だけ静かにします。押し付けがましさを避けるためです。おはよう/おやすみはクールダウンを無視します。",
+                hint_en="After you send a message, MaiMai stays quiet for this many minutes to avoid feeling intrusive "
+                        "(max 60). Morning/night greetings ignore cooldown; use 'Min Proactive Interval' for overall spacing.",
+                hint_ja="あなたがメッセージを送った後、麦麦がこの分数だけ静かにします（最大60分）。"
+                        "おはよう/おやすみはクールダウンを無視します。全体の間隔は「能動発言の最小間隔」で設定してください。",
             ),
             "label": "用户冷却时间（分钟）",
             "order": 3,
+        },
+    )
+    min_trigger_interval_minutes: int = Field(
+        default=240,
+        ge=0,
+        le=1440,
+        description="任意两次主动发言之间的硬性最小间隔（分钟），默认 240（= 至少间隔 4 小时）；填 0 = 不限制。"
+                    "默认作用于全部主动触发（早安、晚安、想念、日程节点、日常巡检）。",
+        json_schema_extra={
+            "hint": "硬性间隔（分钟，0~1440）。默认 240（4 小时）。注意它和「用户冷却」的区别：用户冷却只在"
+                    "你刚说过话后压住日常巡检、且上限只有 60 分钟，早安晚安还会无视它；本项对所有主动触发"
+                    "生效（含早晚安，可用下面的开关豁免），是真正的整体间隔。",
+            "i18n": _schema_i18n(
+                label_en="Min Proactive Interval (min)",
+                label_ja="能動発言の最小間隔（分）",
+                hint_en="Hard minimum spacing between any two proactive messages; default 240 (4 hours), 0 = off. "
+                        "Applies to every trigger including morning/night greetings.",
+                hint_ja="能動メッセージ間の最短間隔（分）。既定 240（4時間）、0=無効。"
+                        "おはよう/おやすみを含むすべてのトリガーに適用されます。",
+            ),
+            "label": "主动发言最小间隔（分钟）",
+            "order": 4,
+        },
+    )
+    min_interval_exempt_greetings: bool = Field(
+        default=False,
+        description="早安/晚安是否豁免上面的「主动发言最小间隔」。默认不豁免（与其它主动发言一视同仁）；"
+                    "如果你希望无论间隔多短都保证每天早晚各一条，就打开它。",
+        json_schema_extra={
+            "hint": "打开后，早安/晚安不受最小间隔限制（仍受静默时段与每日上限约束）。",
+            "i18n": _schema_i18n(
+                label_en="Exempt greetings from min interval",
+                label_ja="おはよう/おやすみを最小間隔から除外",
+                hint_en="When on, morning/night greetings ignore the minimum interval (silence window and daily cap still apply).",
+                hint_ja="オンにすると、おはよう/おやすみは最小間隔を無視します（静默時間帯と1日上限は適用されます）。",
+            ),
+            "label": "早晚安豁免最小间隔",
+            "order": 5,
         },
     )
     proactive_trigger_enabled: bool = Field(
@@ -254,7 +299,7 @@ class ScheduleConfig(PluginConfigBase):
                 hint_ja="オフ時、スケジュールは生成されますが麦麦は能動的にメッセージを送信しません。",
             ),
             "label": "主动触发开关",
-            "order": 4,
+            "order": 6,
         },
     )
     use_external_schedule: bool = Field(
@@ -271,7 +316,7 @@ class ScheduleConfig(PluginConfigBase):
                 hint_ja="オンにすると自主計画プラグインのスケジュールを読み込み、ローカルの生成を停止してキャッシュを消去します。",
             ),
             "label": "使用外部日程",
-            "order": 5,
+            "order": 7,
         },
     )
 
@@ -294,6 +339,11 @@ class ScheduleConfig(PluginConfigBase):
     @classmethod
     def _normalize_cooldown(cls, value: Any) -> int:
         return _normalize_int_in_range(value, 5, 0, 60)
+
+    @field_validator("min_trigger_interval_minutes", mode="before")
+    @classmethod
+    def _normalize_min_trigger_interval(cls, value: Any) -> int:
+        return _normalize_int_in_range(value, 240, 0, 1440)
 
 
 # ---------------------------------------------------------------------------
@@ -451,14 +501,18 @@ class TimeWindowsConfig(PluginConfigBase):
     )
     miss_trigger_hours_min: float = Field(
         default=4.0,
-        description="想念触发区间的下限（小时）：沉默不足这个时间绝不会触发想念。",
+        description="【仅对「想念」生效】想念触发区间的下限（小时）：**用户**沉默不足这个时间绝不会触发想念。"
+                    "它管的是「想念」这一种触发（每天最多一次），不是主动发言的整体间隔——"
+                    "整体间隔由「调度设置」里的「主动发言最小间隔」/「用户冷却时间」控制。",
         json_schema_extra={
-            "hint": "小时，可填小数（如 4.5）。配合上限构成触发区间。",
+            "hint": "小时，可填小数（如 4.5）。配合上限构成触发区间。只影响「想念」，不限制早安/晚安/日常巡检。",
             "i18n": _schema_i18n(
                 label_en="Miss Trigger Min (hours)",
                 label_ja="「会いたい」最小トリガー（時間）",
-                hint_en="Never triggers before this many hours of silence.",
-                hint_ja="この時間未満の沈黙では「会いたい」は発生しません。",
+                hint_en="Never triggers 'missing you' before this many hours of USER silence. This only gates the "
+                        "miss trigger (once per day), not the overall spacing — see 'Min Proactive Interval'.",
+                hint_ja="ユーザーの沈黙がこの時間未満では「会いたい」は発生しません。これは「会いたい」専用で、"
+                        "全体の間隔は「能動発言の最小間隔」で設定します。",
             ),
             "label": "想念触发下限（小时）",
             "order": 4,
@@ -466,15 +520,15 @@ class TimeWindowsConfig(PluginConfigBase):
     )
     miss_trigger_hours_max: float = Field(
         default=8.0,
-        description="想念触发区间的上限（小时）：沉默超过这个时间后每次巡检都会满足时长条件。"
+        description="【仅对「想念」生效】想念触发区间的上限（小时）：用户沉默超过这个时间后每次巡检都会满足时长条件。"
                     "区间内每次巡检随机取一个阈值，沉默越久越容易触发，行为不再像定时炸弹。",
         json_schema_extra={
-            "hint": "小时。上限应 ≥ 下限；写反时自动交换。",
+            "hint": "小时。上限应 ≥ 下限；写反时自动交换。只影响「想念」。",
             "i18n": _schema_i18n(
                 label_en="Miss Trigger Max (hours)",
                 label_ja="「会いたい」最大トリガー（時間）",
-                hint_en="After this many hours the duration condition always passes.",
-                hint_ja="この時間を超えると条件は常に満たされます。",
+                hint_en="After this many hours of USER silence the duration condition always passes (miss trigger only).",
+                hint_ja="ユーザーの沈黙がこの時間を超えると条件は常に満たされます（「会いたい」専用）。",
             ),
             "label": "想念触发上限（小时）",
             "order": 5,
@@ -757,13 +811,82 @@ class LLMLogConfig(PluginConfigBase):
 
 
 # ---------------------------------------------------------------------------
+# 主动行为决策日志
+# ---------------------------------------------------------------------------
+
+
+class ProactiveLogConfig(PluginConfigBase):
+    """主动行为决策日志：记录每轮巡检的判定结论（静默/最小间隔/冷却/概率/预算/动作），供 /mai_diag 查看。
+
+    和「LLM 调用日志」互补：主动私聊本身不调用插件的 LLM，所以"为什么又发了""今天怎么没发"
+    这类问题只有本日志能回答。
+    """
+
+    __ui_label__: ClassVar[str] = "主动行为日志"
+    __ui_order__: ClassVar[int] = 8
+
+    enabled: bool = Field(
+        default=True,
+        description="记录每轮巡检的判定结论：是否静默、距上次主动发言多久、最小间隔/冷却是否通过、"
+                    "概率掷点、当日预算余量、最终动作与原因。用 /mai_diag 命令查看。",
+        json_schema_extra={
+            "hint": "排查「为什么又主动找我了 / 今天怎么没发」就开着。只写日志，不影响任何判定。",
+            "i18n": _schema_i18n(
+                label_en="Proactive Decision Log",
+                label_ja="能動行動の意思決定ログ",
+                hint_en="Log every patrol decision (silence / min interval / cooldown / dice / budget / action); view via /mai_diag.",
+                hint_ja="巡回ごとの判定（静默/最小間隔/クールダウン/確率/上限/動作）を記録し、/mai_diag で確認します。",
+            ),
+            "label": "启用主动行为日志",
+            "order": 0,
+        },
+    )
+    record_skips: bool = Field(
+        default=True,
+        description="是否连「这一轮没发言」也记下来（含原因）。关闭后只记录真正发言的轮次，"
+                    "日志更短，但就查不出「为什么没发」了。",
+        json_schema_extra={
+            "hint": "建议保持开启——「为什么没发」和「为什么发了」一样重要（默认 10 分钟一轮，一天约 144 条）。",
+            "i18n": _schema_i18n(
+                label_en="Record skipped rounds",
+                label_ja="スキップした巡回も記録",
+                hint_en="Also log rounds that did NOT speak, with the reason. Keep on to answer 'why didn't it send?'.",
+                hint_ja="発言しなかった巡回も理由つきで記録します。「なぜ送らなかったか」を調べるにはオンにしてください。",
+            ),
+            "label": "记录未发言轮次",
+            "order": 1,
+        },
+    )
+    retention_days: int = Field(
+        default=3,
+        description="日志保留天数，过期自动清理。",
+        json_schema_extra={
+            "hint": "默认 3 天；1-30 之间。",
+            "i18n": _schema_i18n(
+                label_en="Retention (days)",
+                label_ja="保持日数",
+                hint_en="Older log files are deleted automatically.",
+                hint_ja="古いログは自動削除されます。",
+            ),
+            "label": "日志保留天数",
+            "order": 2,
+        },
+    )
+
+    @field_validator("retention_days", mode="before")
+    @classmethod
+    def _normalize_retention(cls, value: Any) -> int:
+        return _normalize_int_in_range(value, 3, 1, 30)
+
+
+# ---------------------------------------------------------------------------
 # 顶层配置聚合
 # ---------------------------------------------------------------------------
 
 
 class MaiLoverPluginSettings(PluginConfigBase):
     """麦麦恋人插件完整配置。包含开关、白名单、调度、概率、时间窗、好感度、
-    恋人电脑联动、LLM 日志八大模块。"""
+    恋人电脑联动、LLM 日志、主动行为日志九大模块。"""
 
     plugin: PluginConfig = Field(default_factory=PluginConfig)
     whitelist: WhitelistConfig = Field(default_factory=WhitelistConfig)
@@ -773,6 +896,7 @@ class MaiLoverPluginSettings(PluginConfigBase):
     affection: AffectionConfig = Field(default_factory=AffectionConfig)
     cateye: CateyeConfig = Field(default_factory=CateyeConfig)
     llm_log: LLMLogConfig = Field(default_factory=LLMLogConfig)
+    proactive_log: ProactiveLogConfig = Field(default_factory=ProactiveLogConfig)
 
 
 # ---------------------------------------------------------------------------

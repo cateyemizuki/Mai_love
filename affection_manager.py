@@ -204,7 +204,9 @@ class AffectionManager:
         self._data["miss_sent_today"] = False
         self._data["morning_sent_today"] = False
         self._data["night_sent_today"] = False
-        self._data["last_speak_time"] = ""
+        # v2.4.2：不再清空 last_speak_time。
+        # 它是「用户冷却」与「主动发言最小间隔」的基准时间，清空会让跨午夜的第一个巡检
+        # 直接失去间隔约束（例如 23:58 刚发过、00:08 又能发）。计数与当日标记仍然照旧重置。
         self.flush()
 
     # ── 持久化控制 ────────────────────────────────────────────────────

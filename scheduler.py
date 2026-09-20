@@ -14,6 +14,15 @@ v2.3.0: 想念机制改造——
 - 触发前可先经 LLM 以角色身份判断"此刻主动说想你了是否自然"，不自然则驳回
   （驳回后 30 分钟内不再重复打扰判断），LLM 不可用/无法解析时按驳回处理；
 - 触发 reason 提示词与把关提示词均可在配置中查看和修改。
+
+v2.4.2（cateye 维护）:
+- 新增「主动发言最小间隔」（``schedule.min_trigger_interval_minutes``）：对所有主动触发
+  （含早安/晚安）生效的硬性间隔，填补此前只能用「用户冷却」凑间隔、而它又被限制在
+  60 分钟以内的空白；
+- 时间窗口配置非法时不再静默失效：记 warning，且静默时段按「视为静默」、早晚安窗口按
+  「不触发」处理（fail-safe，宁可不发）；
+- 每轮巡检的判定结论写入「主动行为决策日志」（``decision_logger``），可回答
+  "为什么又发了 / 今天怎么没发"。
 """
 
 import asyncio
@@ -23,11 +32,43 @@ from typing import Any, Optional
 
 from .affection_manager import AffectionManager
 from .config import MaiLoverPluginSettings
+from .decision_logger import ACTION_SKIP, ACTION_TRIGGER, ProactiveDecisionLogger
 from .llm_service import LLMService
 from .schedule_generator import ScheduleGenerator
 
 # 想念被 LLM 驳回后，多久之内不再重复发起把关判断（分钟）
 MISS_REJECT_COOLDOWN_MINUTES = 30.0
+
+#: 需要校验格式（HH:MM）的时间窗口配置项
+TIME_WINDOW_KEYS = (
+    "silence_start",
+    "silence_end",
+    "morning_start",
+    "morning_end",
+    "night_start",
+    "night_end",
+)
+
+#: 跳过原因优先级：一轮巡检里若多个候选触发都被挡，只保留优先级最高的那个原因。
+#: 否则「早安被最小间隔挡住」会被后面「日常巡检掷点没中」覆盖，日志就答非所问。
+#: 数值越大越"值得报告"；同优先级时保留先出现的（即更高等级的触发）。
+SKIP_PRIORITY: dict[str, int] = {
+    "invalid_time_config": 100,
+    "disabled": 96,
+    "daily_max_zero": 96,
+    "silence": 95,
+    "planner_trigger_failed": 85,
+    "min_interval": 80,
+    "cooldown": 70,
+    "budget": 60,
+    "llm_rejected": 50,
+    "dice": 40,
+    "future_schedule": 30,
+    "miss_duration": 25,
+    "already_sent_today": 10,
+    "no_user_message": 10,
+    "no_candidate": 0,
+}
 
 
 class Scheduler:
@@ -49,6 +90,7 @@ class Scheduler:
         schedule_generator: ScheduleGenerator,
         llm_service: Optional[LLMService] = None,
         cateye_client: Optional[Any] = None,
+        decision_logger: Optional[ProactiveDecisionLogger] = None,
     ) -> None:
         """初始化调度器。
 
@@ -59,6 +101,7 @@ class Scheduler:
             schedule_generator: 日程生成器。
             llm_service: LLM 服务（想念触发的 LLM 把关用；None = 跳过把关）。
             cateye_client: 恋人电脑联动客户端（None = 不查看电脑状态）。
+            decision_logger: 主动行为决策日志（None = 不记录）。
         """
         self._ctx: Any = ctx
         self._config: MaiLoverPluginSettings = config
@@ -66,6 +109,7 @@ class Scheduler:
         self._schedule_gen: ScheduleGenerator = schedule_generator
         self._llm: Optional[LLMService] = llm_service
         self._cateye: Optional[Any] = cateye_client
+        self._decision_logger: Optional[ProactiveDecisionLogger] = decision_logger
         self._stop_event: asyncio.Event = asyncio.Event()
         self._target_qq: str = ""
         self._stream_id: str = ""
@@ -73,6 +117,8 @@ class Scheduler:
         self._lover_name: str = "麦麦"
         self._last_trigger_time: Optional[datetime] = None
         self._miss_last_reject_at: Optional[datetime] = None
+        # 非法时间窗口配置的告警节流：配置项 -> 已告警过的原始值
+        self._invalid_time_warned: dict[str, str] = {}
 
     def set_target(self, target_qq: str, stream_id: str) -> None:
         """设置白名单目标用户。
@@ -278,39 +324,151 @@ class Scheduler:
         if self._affection.today_date() != current_date:
             self._affection.reset_daily(current_date)
 
-        # 静默时段：完全不触发任何主动行为
-        silence_start = self._config.time_windows.silence_start
-        silence_end = self._config.time_windows.silence_end
-        if self._is_in_time_window(silence_start, silence_end, current_time):
-            return  # 静默时段，跳过本次巡检
+        windows = self._config.time_windows
+        schedule_cfg = self._config.schedule
+        silence_start = windows.silence_start
+        silence_end = windows.silence_end
+        morning_start = windows.morning_start
+        morning_end = windows.morning_end
+        night_start = windows.night_start
+        night_end = windows.night_end
 
-        daily_max_speak = self._config.schedule.daily_max_speak
+        daily_max_speak = int(schedule_cfg.daily_max_speak)
 
         # 为晚安预留 1 个配额：晚安未发时，非晚安触发只能用 daily_max_speak-1
         if self._affection.night_sent_today():
             non_night_budget = daily_max_speak  # 晚安已发，释放预留
         else:
             non_night_budget = daily_max_speak - 1  # 为晚安预留
-        morning_start = self._config.time_windows.morning_start
-        morning_end = self._config.time_windows.morning_end
-        night_start = self._config.time_windows.night_start
-        night_end = self._config.time_windows.night_end
+
+        # ---- v2.4.2：主动发言最小间隔 / 时间配置校验 / 决策日志 ----
+        minutes_since_last_speak = self._minutes_since_last_speak(now)
+        min_interval = max(0, int(getattr(schedule_cfg, "min_trigger_interval_minutes", 0)))
+        exempt_greetings = bool(getattr(schedule_cfg, "min_interval_exempt_greetings", False))
+        interval_blocked = (
+            min_interval > 0
+            and minutes_since_last_speak is not None
+            and minutes_since_last_speak < min_interval
+        )
+        interval_desc = (
+            f"距上次主动发言 {minutes_since_last_speak:.0f} 分钟 < 最小间隔 {min_interval} 分钟"
+            if interval_blocked
+            else ""
+        )
+        invalid_time_keys = self._collect_invalid_time_keys()
+
+        # 本轮判定（每轮恰好写一条；一旦真的发言，后续门控的"跳过"不再覆盖它）
+        decision: dict[str, str] = {
+            "action": ACTION_SKIP,
+            "reason": "no_candidate",
+            "trigger_type": "",
+            "detail": "本轮没有满足条件的触发",
+        }
+        base_fields: dict[str, Any] = {
+            "minutes_since_last_speak": (
+                None if minutes_since_last_speak is None else round(minutes_since_last_speak, 1)
+            ),
+            "min_interval_minutes": min_interval,
+            "cooldown_minutes": int(schedule_cfg.user_cooldown_minutes),
+            "budget_used": round(self._affection.today_speak_count(), 2),
+            "budget_limit": non_night_budget,
+        }
+        if invalid_time_keys:
+            base_fields["invalid_time_config"] = ",".join(invalid_time_keys)
+
+        def mark_skip(reason: str, trigger_type: str = "", detail: str = "") -> None:
+            """记录"本轮跳过"。
+
+            本轮已经发言时不再改写；多个候选都被挡时只保留优先级更高的原因
+            （同优先级保留先出现的，即更高等级的触发），避免"早安被最小间隔挡住"
+            被后面的"日常巡检掷点没中"覆盖。
+            """
+
+            if decision["action"] == ACTION_TRIGGER:
+                return
+            if decision["reason"] != "no_candidate" and (
+                SKIP_PRIORITY.get(reason, 0) <= SKIP_PRIORITY.get(decision["reason"], 0)
+            ):
+                return
+            decision.update(
+                action=ACTION_SKIP, reason=reason, trigger_type=trigger_type, detail=detail
+            )
+
+        def mark_trigger(trigger_type: str, detail: str = "") -> None:
+            """记录"本轮真的发言了"。"""
+
+            decision.update(
+                action=ACTION_TRIGGER,
+                reason=f"{trigger_type}_trigger",
+                trigger_type=trigger_type,
+                detail=detail,
+            )
+
+        def finish() -> None:
+            """把本轮判定写入主动行为决策日志。"""
+
+            self._log_decision(**decision, **base_fields)
+
+        # 总开关关闭 / 每日上限为 0 → 直接停（也记一条，便于解释"今天完全没动静"）
+        if not schedule_cfg.proactive_trigger_enabled:
+            mark_skip("disabled", detail="主动触发开关（proactive_trigger_enabled）已关闭")
+            finish()
+            return
+        if daily_max_speak <= 0:
+            mark_skip("daily_max_zero", detail="每日发言上限为 0（完全静音）")
+            finish()
+            return
+
+        # 静默时段：完全不触发任何主动行为。
+        # 时间配置非法时按"视为静默"处理（fail-safe，宁可不发），_collect_invalid_time_keys 已告警
+        if self._is_in_time_window(silence_start, silence_end, current_time, invalid_result=True):
+            if invalid_time_keys:
+                mark_skip(
+                    "invalid_time_config",
+                    detail=f"时间窗口配置非法（{','.join(invalid_time_keys)}），按静默处理（fail-safe）",
+                )
+            else:
+                mark_skip("silence", detail=f"处于静默时段 {silence_start}-{silence_end}")
+            finish()
+            return
 
         # ==============================
-        # S级：早安检查
+        # S级：早安检查（无视概率与「用户冷却」，但受静默/最小间隔/每日上限约束）
         # ==============================
         if self._is_in_time_window(morning_start, morning_end, current_time):
-            if not self._affection.morning_sent_today():
-                if self._affection.today_speak_count() < non_night_budget:
-                    await self._trigger_morning()
+            if self._affection.morning_sent_today():
+                mark_skip("already_sent_today", "morning", "今天已经发过早安")
+            elif interval_blocked and not exempt_greetings:
+                mark_skip("min_interval", "morning", interval_desc)
+            elif self._affection.today_speak_count() >= non_night_budget:
+                mark_skip(
+                    "budget",
+                    "morning",
+                    f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}（未发晚安，为晚安预留 1 条）",
+                )
+            elif await self._trigger_morning():
+                mark_trigger("morning", "早安触发已入队，由 planner 决定是否发言")
+            else:
+                mark_skip("planner_trigger_failed", "morning", "触发未入队（stream_id 缺失或触发开关关闭）")
 
         # ==============================
         # S级：晚安检查
         # ==============================
         if self._is_in_time_window(night_start, night_end, current_time):
-            if not self._affection.night_sent_today():
-                if self._affection.today_speak_count() < daily_max_speak:
-                    await self._trigger_night()
+            if self._affection.night_sent_today():
+                mark_skip("already_sent_today", "night", "今天已经发过晚安")
+            elif interval_blocked and not exempt_greetings:
+                mark_skip("min_interval", "night", interval_desc)
+            elif self._affection.today_speak_count() >= daily_max_speak:
+                mark_skip(
+                    "budget",
+                    "night",
+                    f"当日预算已用 {self._affection.today_speak_count():.1f}/{daily_max_speak}",
+                )
+            elif await self._trigger_night():
+                mark_trigger("night", "晚安触发已入队，由 planner 决定是否发言")
+            else:
+                mark_skip("planner_trigger_failed", "night", "触发未入队（stream_id 缺失或触发开关关闭）")
 
         # ==============================
         # A级：想念机制
@@ -319,35 +477,60 @@ class Scheduler:
         # ——沉默越久越容易触发（平滑爬升），min 之前绝不触发。
         miss_speak_rate = self._config.probability.miss_speak_rate
 
-        if not self._affection.miss_sent_today():
+        if self._affection.miss_sent_today():
+            mark_skip("already_sent_today", "miss", "今天已经发过想念")
+        else:
             last_msg = self._affection.last_user_msg_time()
-            # 用户从未发过消息 → 不触发想念（避免首次启动就喊想你了）
-            hours_since_last = (
-                (now - last_msg).total_seconds() / 3600 if last_msg else 0
-            )
-            if last_msg and hours_since_last > self._sample_miss_threshold():
-                if not self._has_future_schedule(2, now):
-                    if self._affection.today_speak_count() < non_night_budget:
-                        if not self._is_in_cooldown(now):
-                            if random.random() < miss_speak_rate:
-                                # 电脑状态本次巡检只取一份：把关与触发复用，
-                                # 避免一次触发连截两张屏
-                                computer_context = await self._get_computer_context(now)
-                                # LLM 把关：以角色身份判断此刻开口是否自然，
-                                # 驳回则本轮不触发（30 分钟冷却内不重复判断）
-                                if self._miss_llm_check_enabled():
-                                    if not await self._confirm_missing_with_llm(
-                                        hours_since_last, now, computer_context
-                                    ):
-                                        pass  # 驳回：本轮不触发
-                                    else:
-                                        await self._trigger_missing(
-                                            hours_since_last, computer_context
-                                        )
-                                else:
-                                    await self._trigger_missing(
-                                        hours_since_last, computer_context
-                                    )
+            if last_msg is None:
+                # 用户从未发过消息 → 不触发想念（避免首次启动就喊想你了）
+                mark_skip("no_user_message", "miss", "还没有用户消息记录，不触发想念")
+            else:
+                hours_since_last = (now - last_msg).total_seconds() / 3600
+                miss_threshold = self._sample_miss_threshold()
+                if hours_since_last <= miss_threshold:
+                    mark_skip(
+                        "miss_duration",
+                        "miss",
+                        f"用户沉默 {hours_since_last:.1f}h ≤ 本轮随机阈值 {miss_threshold:.1f}h"
+                        f"（区间 {self._config.time_windows.miss_trigger_hours_min}"
+                        f"~{self._config.time_windows.miss_trigger_hours_max}h）",
+                    )
+                elif self._has_future_schedule(2, now):
+                    mark_skip("future_schedule", "miss", "未来 2 小时内有日程节点，先不打扰")
+                elif self._affection.today_speak_count() >= non_night_budget:
+                    mark_skip(
+                        "budget",
+                        "miss",
+                        f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}",
+                    )
+                elif interval_blocked:
+                    mark_skip("min_interval", "miss", interval_desc)
+                elif self._is_in_cooldown(now):
+                    mark_skip(
+                        "cooldown",
+                        "miss",
+                        f"处于用户冷却期（{int(schedule_cfg.user_cooldown_minutes)} 分钟）内",
+                    )
+                elif random.random() >= miss_speak_rate:
+                    mark_skip("dice", "miss", f"想念概率未通过（miss_speak_rate={miss_speak_rate}）")
+                else:
+                    # 电脑状态本次巡检只取一份：把关与触发复用，
+                    # 避免一次触发连截两张屏
+                    computer_context = await self._get_computer_context(now)
+                    # LLM 把关：以角色身份判断此刻开口是否自然，
+                    # 驳回则本轮不触发（30 分钟冷却内不重复判断）
+                    if self._miss_llm_check_enabled() and not await self._confirm_missing_with_llm(
+                        hours_since_last, now, computer_context
+                    ):
+                        mark_skip("llm_rejected", "miss", "LLM 把关驳回（30 分钟内不重复判断）")
+                    elif await self._trigger_missing(hours_since_last, computer_context):
+                        mark_trigger("miss", f"想念触发已入队（用户沉默 {hours_since_last:.1f}h）")
+                    else:
+                        mark_skip(
+                            "planner_trigger_failed",
+                            "miss",
+                            "触发未入队（stream_id 缺失或触发开关关闭）",
+                        )
 
         # ==============================
         # B级：日程节点匹配 / 日常巡检
@@ -367,18 +550,69 @@ class Scheduler:
             if self._time_match(node_time, current_time):
                 node_matched = True
                 # 节点匹配 → activity_trigger_rate 概率触发活动分享
-                if random.random() < activity_trigger_rate:
-                    if not self._is_in_cooldown(now):
-                        if self._affection.today_speak_count() < non_night_budget:
-                            await self._trigger_activity(node)
+                if interval_blocked:
+                    mark_skip("min_interval", "activity", interval_desc)
+                elif self._is_in_cooldown(now):
+                    mark_skip(
+                        "cooldown",
+                        "activity",
+                        f"处于用户冷却期（{int(schedule_cfg.user_cooldown_minutes)} 分钟）内",
+                    )
+                elif self._affection.today_speak_count() >= non_night_budget:
+                    mark_skip(
+                        "budget",
+                        "activity",
+                        f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}",
+                    )
+                elif random.random() >= activity_trigger_rate:
+                    mark_skip(
+                        "dice",
+                        "activity",
+                        f"活动分享概率未通过（activity_trigger_rate={activity_trigger_rate}）",
+                    )
+                elif await self._trigger_activity(node):
+                    node_label = str(node.get("activity") or node.get("name") or node_time)
+                    mark_trigger("activity", f"日程节点触发已入队：{node_time} {node_label}")
+                else:
+                    mark_skip(
+                        "planner_trigger_failed",
+                        "activity",
+                        "触发未入队（stream_id 缺失或触发开关关闭）",
+                    )
                 break  # 只匹配一个节点
 
         # 没有节点匹配 → default_speak_rate 概率触发日常巡检
         if not node_matched:
-            if random.random() < default_speak_rate:
-                if not self._is_in_cooldown(now):
-                    if self._affection.today_speak_count() < non_night_budget:
-                        await self._trigger_daily()
+            if interval_blocked:
+                mark_skip("min_interval", "daily", interval_desc)
+            elif self._is_in_cooldown(now):
+                mark_skip(
+                    "cooldown",
+                    "daily",
+                    f"处于用户冷却期（{int(schedule_cfg.user_cooldown_minutes)} 分钟）内",
+                )
+            elif self._affection.today_speak_count() >= non_night_budget:
+                mark_skip(
+                    "budget",
+                    "daily",
+                    f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}",
+                )
+            elif random.random() >= default_speak_rate:
+                mark_skip(
+                    "dice",
+                    "daily",
+                    f"日常巡检概率未通过（default_speak_rate={default_speak_rate}）",
+                )
+            elif await self._trigger_daily():
+                mark_trigger("daily", "日常巡检触发已入队")
+            else:
+                mark_skip(
+                    "planner_trigger_failed",
+                    "daily",
+                    "触发未入队（stream_id 缺失或触发开关关闭）",
+                )
+
+        finish()
 
     async def _trigger_planner(self, intent: str, reason: str) -> bool:
         """统一触发 planner 主动处理。
@@ -407,26 +641,28 @@ class Scheduler:
             self._ctx.logger.error(f"proactive_trigger 失败: {e}")
             return False
 
-    async def _trigger_morning(self) -> None:
-        """触发早安 planner（触发前看一眼恋人的电脑）。"""
+    async def _trigger_morning(self) -> bool:
+        """触发早安 planner（触发前看一眼恋人的电脑）；返回是否入队成功。"""
         self._ctx.logger.info("S级触发: 早安")
         reason = "早上好，可以说早安" + await self._get_computer_context(datetime.now())
         success = await self._trigger_planner("morning", reason)
         if success:
             self._affection.set_morning_sent()
+        return success
 
-    async def _trigger_night(self) -> None:
-        """触发晚安 planner（触发前看一眼恋人的电脑）。"""
+    async def _trigger_night(self) -> bool:
+        """触发晚安 planner（触发前看一眼恋人的电脑）；返回是否入队成功。"""
         self._ctx.logger.info("S级触发: 晚安")
         reason = "晚上好，可以说晚安" + await self._get_computer_context(datetime.now())
         success = await self._trigger_planner("night", reason)
         if success:
             self._affection.set_night_sent()
+        return success
 
     async def _trigger_missing(
         self, hours_since_last: float, computer_context: str = ""
-    ) -> None:
-        """触发想念 planner。
+    ) -> bool:
+        """触发想念 planner；返回是否入队成功。
 
         Args:
             hours_since_last: 距用户最后一条消息的小时数（填入 reason 提示词）。
@@ -439,6 +675,7 @@ class Scheduler:
         success = await self._trigger_planner("missing", reason)
         if success:
             self._affection.set_miss_sent()
+        return success
 
     async def _get_computer_context(self, now: datetime) -> str:
         """获取恋人电脑状态文案（未启用联动 / 无客户端时返回空串）。"""
@@ -602,22 +839,63 @@ class Scheduler:
             return True
         return None
 
-    async def _trigger_activity(self, node: dict[str, Any]) -> None:
-        """触发日程节点活动 planner。
+    async def _trigger_activity(self, node: dict[str, Any]) -> bool:
+        """触发日程节点活动 planner；返回是否入队成功。
 
         Args:
             node: 日程节点（含 activity 字段）。
         """
         activity = str(node.get("activity", ""))
         self._ctx.logger.info(f"B级触发: 日程节点 - {activity}")
-        await self._trigger_planner(
+        return await self._trigger_planner(
             "activity", f"{self._lover_name}现在在{activity}，可以分享"
         )
 
-    async def _trigger_daily(self) -> None:
-        """触发日常巡检 planner。"""
+    async def _trigger_daily(self) -> bool:
+        """触发日常巡检 planner；返回是否入队成功。"""
         self._ctx.logger.info("B级触发: 日常巡检")
-        await self._trigger_planner("daily", "日常巡检")
+        return await self._trigger_planner("daily", "日常巡检")
+
+    def _minutes_since_last_speak(self, now: datetime) -> Optional[float]:
+        """距上一次主动发言过去了多少分钟；没有记录时返回 None。"""
+
+        last_speak = self._affection.last_speak_time()
+        if last_speak is None:
+            return None
+        return max(0.0, (now - last_speak).total_seconds() / 60)
+
+    def _collect_invalid_time_keys(self) -> list[str]:
+        """收集格式非法的（HH:MM）时间窗口配置项，并对每个非法值告警一次。
+
+        非法值会按 fail-safe 处理：静默时段视为"在静默中"（不发言），
+        早晚安窗口视为"不在窗口内"（不触发）。
+        """
+
+        invalid: list[str] = []
+        for key in TIME_WINDOW_KEYS:
+            raw = str(getattr(self._config.time_windows, key, "") or "")
+            try:
+                Scheduler._time_to_minutes(raw)
+            except ValueError:
+                invalid.append(key)
+                if self._invalid_time_warned.get(key) != raw:
+                    self._invalid_time_warned[key] = raw
+                    level = getattr(self._ctx.logger, "warning", self._ctx.logger.info)
+                    level(
+                        f"时间窗口配置 {key}={raw!r} 不是 HH:MM 格式；已按 fail-safe 处理"
+                        f"（静默时段视为静默、早晚安窗口视为不触发，宁可不发）。请检查插件配置。"
+                    )
+        return invalid
+
+    def _log_decision(self, *, action: str, **fields: Any) -> None:
+        """写一条主动行为决策记录（未启用日志时静默 no-op）。"""
+
+        if self._decision_logger is None:
+            return
+        try:
+            self._decision_logger.record(action=action, **fields)
+        except Exception as e:  # noqa: BLE001 - 日志故障绝不影响巡检
+            self._ctx.logger.debug(f"写主动行为决策日志失败（忽略）: {e}")
 
     def _is_in_cooldown(self, now: datetime) -> bool:
         """检查是否在冷却期内。
@@ -644,7 +922,7 @@ class Scheduler:
 
     @staticmethod
     def _is_in_time_window(
-        window_start: str, window_end: str, current: str
+        window_start: str, window_end: str, current: str, *, invalid_result: bool = False
     ) -> bool:
         """检查当前时间是否在指定时间窗口内。
 
@@ -654,16 +932,19 @@ class Scheduler:
             window_start: 窗口开始时间（HH:MM）。
             window_end: 窗口结束时间（HH:MM）。
             current: 当前时间（HH:MM）。
+            invalid_result: 时间字符串解析失败时的返回值（fail-safe 方向）。
+                静默时段传 True（"视为静默"，宁可不发）；早晚安窗口保持默认 False
+                （"不在窗口内"，不触发）。
 
         Returns:
-            True 表示在窗口内。
+            True 表示在窗口内（或解析失败且 invalid_result=True）。
         """
         try:
             start_minutes = Scheduler._time_to_minutes(window_start)
             end_minutes = Scheduler._time_to_minutes(window_end)
             current_minutes = Scheduler._time_to_minutes(current)
         except ValueError:
-            return False
+            return invalid_result
 
         if start_minutes <= end_minutes:
             return start_minutes <= current_minutes <= end_minutes
