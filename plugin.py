@@ -12,6 +12,17 @@ v2.0.0 架构变更：
   on_config_update(scope="bot") 时刷新
 - 删除关键词拦截（hook_handler.py），消息正常放行给 planner
 
+v2.5.0 变更：
+- 注入按会话分档：日期行全会话注入；【当前状态/好感度】默认只在目标用户
+  私聊注入，群聊需显式开启且"最近 X 条用户消息里出现恋人"才注入
+- 注入文案标注用户（昵称 + QQ 号）与作用范围，避免模型把恋人语气用在所有人身上
+
+v2.6.0 变更：
+- 屏幕感知（恋人电脑截图 + 视觉转述）改为「触发时先取、再唤醒 planner」：
+  旁白进 ``screen_context`` 缓存，由 ``maisaka.planner.before_request`` 与新增的
+  ``maisaka.replyer.before_model_request`` 以「尾随锚点」方式插进请求上下文
+  （bot 身份的 AssistantMessageItem），不再拼进 reason 提示词
+
 导出 create_plugin() 函数返回 MaiLoverPlugin 实例。
 """
 
@@ -43,9 +54,22 @@ from .memory_manager import MemoryManager
 from .message_service import MessageService
 from .schedule_generator import ScheduleGenerator
 from .scheduler import Scheduler
+from .screen_context import (
+    CHANNEL_PLANNER,
+    CHANNEL_REPLYER,
+    ScreenContextStore,
+    build_narration_item,
+)
+from .sender_identity import (
+    SenderCache,
+    SessionKindCache,
+    extract_session_info_from_message,
+    extract_user_id_from_message,
+    sender_ids_in_window,
+)
 
 # ──────────────────────────────────────────────────────────────────────────
-# [LOCAL-PATCH:cateye] 本地修改（基于上游 v2.4.0），共两处，均已用该标记注释：
+# [LOCAL-PATCH:cateye] 本地修改（基于上游 v2.4.0），均已用该标记注释：
 #   1) planner 活动注入的 payload 守卫：原先 payload > 1MB 就整体跳过注入，而宿主把图片
 #      以 image_base64 内联进 items 快照（request_snapshot.py:264-271），带几张图的上下文
 #      常态就是 2–12MB —— 线上日志实测注入几乎从未生效。现改为"超限则按体积从大到小把
@@ -55,6 +79,19 @@ from .scheduler import Scheduler
 #      任何回复目标参数**，回复对象完全由 planner 自主决定；主动私聊那一轮没有用户消息
 #      可锚，目标就会落到 bot 自己上一条发言。这里用一条软约束把目标引导回对方，只在最近
 #      _PROACTIVE_RULE_WINDOW_SECONDS 秒内有过 proactive trigger 时注入，不影响普通回合。
+#   3) v2.5.0 注入作用域与用户标注：原先 planner 注入不看 session_id，任何会话（含群聊）
+#      都会被塞进【当前状态/对用户的好感度】，文案又不带用户标识 —— 实测（2026-09-20 群聊
+#      日志）模型因此在群里按"与恋人的热恋档位"对待所有人。现在：日期行保持全局（中性事实），
+#      恋人上下文默认只在目标用户私聊注入；群聊需要显式开启且"最近 X 条用户消息里出现恋人"
+#      才注入，并且文案里写明好感度属于哪一个用户。
+#   4) v2.6.0 屏幕旁白「尾随锚点」注入：屏幕转述不再拼进 proactive.trigger 的 reason
+#      （那等于往 planner 里塞提示词），改为触发时发布到 screen_context 缓存，由本文件的
+#      两个请求 Hook 在**请求级**插进上下文。不落宿主历史、不写消息库、不真发平台。
+#      锚点在 planner / replyer 两通道分开识别（上下文不一定相同），锚点滑出即只作废该通道。
+#      只对恋人私聊流生效（复用 _resolve_injection_scope，群聊与其他会话一律不注入）。
+#      走不了 MessageGateway 的原因：私聊 session_id 由发送者 user_id 决定，
+#      user_id=机器人自己算出的是「bot 跟自己聊天」的幽灵流；而 is_notify=True 的记录
+#      会被宿主恢复上下文时跳过（src/maisaka/runtime.py），planner 读不到。
 # ──────────────────────────────────────────────────────────────────────────
 #: 超过此体积就先省略图片再注入；宿主单帧上限 16MB（transport/base.py:18），留编码余量。
 _MAX_INJECT_PAYLOAD_BYTES = 8 * 1024 * 1024
@@ -99,7 +136,10 @@ class MaiLoverPlugin(MaiBotPlugin):
     - on_load: 初始化所有子模块，缓存人设，启动调度器
     - on_unload: 停止调度器，刷新好感度数据
     - on_config_update: 热重载配置，scope="bot" 时刷新人设
-    - on_planner_before_request: 注入麦麦当前活动到 planner extra_prompt
+    - on_planner_before_request: 注入当前日期（全会话）与恋人上下文
+      （v2.5.0 起默认仅目标私聊 + 文案标注用户），
+      并按「尾随锚点」插入屏幕旁白（v2.6.0）
+    - on_replyer_before_model_request: replyer 通道的屏幕旁白注入（v2.6.0）
     - Tools: mai_lover_status / mai_lover_schedule / mai_lover_send_message /
              mai_lover_affection / mai_lover_config / mai_lover_current_activity
     - Commands: /mai_status / /mai_schedule / /mai_affection / /mai_help /
@@ -110,6 +150,14 @@ class MaiLoverPlugin(MaiBotPlugin):
 
     # 订阅主程序 bot 配置热重载（含 personality.personality）
     config_reload_subscriptions: ClassVar[Iterable[str]] = ("bot",)
+
+    # ── 注入作用域（v2.5.0）────────────────────────────────────────────
+    #: 目标用户私聊：注入完整恋人上下文
+    INJECT_SCOPE_PRIVATE: ClassVar[str] = "private"
+    #: 群聊（开关打开且最近消息里出现恋人）：注入完整恋人上下文 + 群聊限定说明
+    INJECT_SCOPE_GROUP: ClassVar[str] = "group"
+    #: 其他会话：只注入中性的日期行
+    INJECT_SCOPE_SKIP: ClassVar[str] = "skip"
 
     def __init__(self) -> None:
         super().__init__()
@@ -129,6 +177,17 @@ class MaiLoverPlugin(MaiBotPlugin):
         self._cached_personality: str = ""
         self._stream_retry_task: Optional[asyncio.Task[Any]] = None
         self._cached_nickname: str = ""
+        # v2.5.0：目标用户在宿主里的昵称/群名片（**仅用于注入文案展示**，
+        # 判定一律只看 QQ 号），在解析私聊 stream_id 时顺带缓存
+        self._cached_target_nickname: str = ""
+        self._cached_target_cardname: str = ""
+        # v2.5.0：发送者身份缓存——上下文条目里只有 msg_id 与显示名，
+        # 靠「消息 ID → 发送者 QQ」反查判定"这条消息是不是恋人发的"
+        self._senders: SenderCache = SenderCache()
+        # v2.5.0：「会话 ID → 是否群聊」，判定群聊注入与文案限定
+        self._session_kinds: SessionKindCache = SessionKindCache()
+        # v2.6.0：屏幕旁白「尾随锚点」注入缓存（planner / replyer 分开跟踪）
+        self._screen_store: Optional[ScreenContextStore] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -173,7 +232,7 @@ class MaiLoverPlugin(MaiBotPlugin):
         self._message_svc = MessageService(
             self.ctx, self.config, self._affection_mgr, lover_name
         )
-        self._holiday_svc = HolidayService(self.config)
+        self._holiday_svc = HolidayService(self.config, data_dir=data_dir)
         # 外部日程源：use_external_schedule 开启时，ScheduleGenerator 从中读取
         # 自主规划插件（xuqian13.autonomous-planning-plugin-v4）的日程
         self._external_src = ExternalScheduleSource(self.ctx)
@@ -181,22 +240,30 @@ class MaiLoverPlugin(MaiBotPlugin):
             data_dir, self.config, self._llm_svc, self._holiday_svc,
             external_source=self._external_src,
         )
-        # 恋人电脑联动（v2.4.0）：想念/早晚安触发时查看恋人在电脑上干什么
+        # 恋人电脑联动（v2.4.0）：主动触发时查看恋人在电脑上干什么
         self._cateye = CateyeClient(self.ctx, self.config, self._llm_svc)
+        # 屏幕旁白缓存（v2.6.0）：触发时发布，planner/replyer 请求时以「尾随锚点」
+        # 方式写进上下文（见 screen_context 模块说明）
+        self._screen_store = ScreenContextStore(
+            ttl_minutes=float(self.config.cateye.context_ttl_minutes)
+        )
 
         # 创建调度器（v2.0.0: 仅 4 个依赖，不再传 message_svc/memory_mgr；
         # v2.3.0: 传入 LLM 服务供想念触发前的 LLM 把关使用；
         # v2.4.0: 传入恋人电脑客户端供触发时查看电脑状态；
-        # v2.4.2: 传入主动行为决策日志）
+        # v2.4.2: 传入主动行为决策日志；
+        # v2.6.0: 传入屏幕旁白缓存）
         self._scheduler = Scheduler(
             self.ctx, self.config, self._affection_mgr, self._schedule_gen,
             llm_service=self._llm_svc,
             cateye_client=self._cateye,
             decision_logger=self._decision_logger,
+            screen_store=self._screen_store,
         )
         self._scheduler.set_personality(self._cached_personality)
         if lover_name:
             self._scheduler.set_lover_name(lover_name)
+        self._sync_target_display_name()
 
         target_qq = str(self.config.whitelist.target_qq)
         if not target_qq or target_qq == "123456789":
@@ -218,6 +285,10 @@ class MaiLoverPlugin(MaiBotPlugin):
             self._affection_mgr.flush()
         if self._scheduler is not None:
             self._scheduler.stop()
+        self._senders.clear()
+        self._session_kinds.clear()
+        if self._screen_store is not None:
+            self._screen_store.discard()
         if self._stream_retry_task is not None:
             self._stream_retry_task.cancel()
             try:
@@ -263,6 +334,10 @@ class MaiLoverPlugin(MaiBotPlugin):
             self._schedule_gen._config = self.config
         if self._cateye is not None:
             self._cateye._config = self.config
+        if self._screen_store is not None:
+            self._screen_store.ttl_seconds = (
+                max(0.0, float(self.config.cateye.context_ttl_minutes)) * 60.0
+            )
         if self._llm_logger is not None:
             self._llm_logger.update_settings(
                 self.config.llm_log.enabled,
@@ -285,17 +360,52 @@ class MaiLoverPlugin(MaiBotPlugin):
                 llm_service=self._llm_svc,
                 cateye_client=self._cateye,
                 decision_logger=self._decision_logger,
+                screen_store=self._screen_store,
             )
             self._scheduler.set_personality(self._cached_personality)
             lover_name = self._get_lover_name()
             if lover_name:
                 self._scheduler.set_lover_name(lover_name)
+            self._sync_target_display_name()
         await self._start_scheduler()
 
         self.ctx.logger.info("配置热更新完成")
         return None
 
     # ── HookHandler ────────────────────────────────────────────────────
+
+    @HookHandler(
+        "chat.receive.before_process",
+        name="mai_lover_sender_identity",
+        description="记录入站消息的「消息 ID → 发送者 QQ 号」与「会话 ID → 是否群聊」，供 planner 注入按 QQ 号判定恋人",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def on_receive_before_process(
+        self, message: dict[str, Any] | None = None, **kwargs: Any
+    ) -> None:
+        """入站消息记录发送者身份（只记录，不拦截、不改写）。
+
+        v2.5.0：宿主写进 planner 上下文的消息只有 ``msg_id`` 与显示名，没有 QQ 号
+        （``maisaka/context/planner_messages.py:60-72``），而"这条消息是不是恋人发的"
+        必须按 QQ 号判定（昵称/群名片可被随意改名、伪造）。这里在入站链路上把
+        「消息 ID → 发送者 QQ 号」与「会话 ID → 是否群聊」记下来，请求前用 msg_id
+        反查即可。做法与 ``cateye_admin_identity`` 同一套机制。
+        """
+        del kwargs
+        try:
+            session_id, is_group = extract_session_info_from_message(message)
+            if session_id and is_group is not None:
+                self._session_kinds.record(session_id, is_group)
+            user_id = extract_user_id_from_message(message)
+            message_id = message.get("message_id") if isinstance(message, dict) else None
+            if user_id and message_id:
+                self._senders.record(message_id, user_id)
+        except Exception as e:  # noqa: BLE001 - 记录失败绝不影响消息处理
+            self.ctx.logger.debug(f"记录发送者身份失败（忽略）: {e}")
+        return None
 
     @HookHandler(
         "chat.receive.after_process",
@@ -337,12 +447,27 @@ class MaiLoverPlugin(MaiBotPlugin):
         每次 planner 请求时触发（含用户正常回复和 proactive trigger），
         让麦麦在任何时候都知道自己在做什么。
 
+        注入作用域（v2.5.0，[LOCAL-PATCH:cateye]）：
+        - 【当前日期】对所有会话注入（中性事实，不含任何恋人设定）；
+        - 【{name}当前状态】/【{name}对用户 X 的好感度】默认**只在目标用户私聊**注入，
+          并标注好感度属于哪一位用户；群聊需要 ``injection.group_affection_enabled``
+          打开，且上下文最后 ``injection.group_recent_user_messages`` 条用户消息里
+          出现过目标用户，此时才额外附一句"恋人语气只对 TA 生效"的限定。
+          原因：群聊里注入"对用户的好感度"这类私聊恋人设定，会让 bot 把恋人语气
+          用到所有人身上（实测：群里按热恋档位对待所有群友）。
+
         注入方式（v2.3.1 修复）：宿主在 planner 请求后只回读 ``items``
         （1.2.x ContextItem 快照投影）或 ``messages``（更早版本 role/content
         投影）——往 ``extra_prompt`` 写值会被宿主忽略（那是
         ``maisaka.replyer.before_request`` 的字段），因此按入参投影构造一条
         system 消息插入上下文，其余 kwargs 全量回传。
         """
+        # v2.6.0：屏幕旁白注入。与活动注入相互独立，所以**先算**——
+        # 保证下面任何一条早退路径（缺日程服务 / 载荷超限 / suffix 为空）都不会把旁白丢掉。
+        narration_kwargs = self._with_screen_narration(kwargs, CHANNEL_PLANNER)
+        if narration_kwargs is not None:
+            kwargs = narration_kwargs
+
         if not self._schedule_gen or not self._holiday_svc:
             return {"action": "continue", "modified_kwargs": kwargs}
 
@@ -356,6 +481,11 @@ class MaiLoverPlugin(MaiBotPlugin):
         else:
             return {"action": "continue", "modified_kwargs": kwargs}
 
+        # 先定作用域（要读用户消息文本），再决定裁剪与拼接
+        scope = self._resolve_injection_scope(
+            str(kwargs.get("session_id") or ""), payload
+        )
+
         # [LOCAL-PATCH:cateye] 超限不再整体跳过：先把最大的图片 part 换成文本占位符再注入。
         payload, omitted_images = self._shrink_payload_for_injection(payload)
         if payload is None:
@@ -368,9 +498,10 @@ class MaiLoverPlugin(MaiBotPlugin):
                 f"planner payload 过大，已省略 {omitted_images} 张图片以完成活动注入"
             )
 
-        suffix = await self._build_activity_suffix()
-        # [LOCAL-PATCH:cateye] 主动发言回合追加回复目标约束（宿主无法强制目标，只能软约束）
-        suffix += self._build_proactive_target_rule()
+        suffix = await self._build_activity_suffix(scope)
+        if scope != self.INJECT_SCOPE_SKIP:
+            # [LOCAL-PATCH:cateye] 主动发言回合追加回复目标约束（宿主无法强制目标，只能软约束）
+            suffix += self._build_proactive_target_rule()
         if not suffix:
             return {"action": "continue", "modified_kwargs": kwargs}
 
@@ -378,18 +509,111 @@ class MaiLoverPlugin(MaiBotPlugin):
         modified_kwargs: dict[str, Any] = {**kwargs, payload_key: modified_payload}
         return {"action": "continue", "modified_kwargs": modified_kwargs}
 
-    async def _build_activity_suffix(self) -> str:
-        """构造当前活动注入文本（日期/节假日/当前活动/好感度）。"""
+    @HookHandler("maisaka.replyer.before_model_request")
+    async def on_replyer_before_model_request(self, **kwargs: Any) -> dict[str, Any]:
+        """把屏幕旁白插进 replyer 的模型请求上下文（v2.6.0）。
+
+        replyer 的上下文与 planner **不一定相同**（它由 planner 选定后再组织，
+        条数与裁剪都可能不一样），所以旁白的锚点在两个通道里**分开识别、分开失效**
+        （见 :mod:`screen_context`）。
+
+        这里只做旁白注入，不碰 replyer 的其他入参（``extra_prompt`` 等保持原样）；
+        没有待注入内容时原样回传 kwargs，不做无意义的载荷替换。
+        """
+        narration_kwargs = self._with_screen_narration(kwargs, CHANNEL_REPLYER)
+        if narration_kwargs is None:
+            return {"action": "continue"}
+        return {"action": "continue", "modified_kwargs": narration_kwargs}
+
+    # ── [LOCAL-PATCH:cateye] v2.6.0 屏幕旁白注入 ──────────────────────────
+
+    def _with_screen_narration(
+        self, kwargs: dict[str, Any], channel: str
+    ) -> Optional[dict[str, Any]]:
+        """在请求载荷里插入屏幕旁白；没有可注入内容时返回 None。
+
+        Args:
+            kwargs: Hook 载荷（含 ``items`` 或旧版 ``messages``）。
+            channel: :data:`CHANNEL_PLANNER` / :data:`CHANNEL_REPLYER`。
+
+        Returns:
+            替换过上下文列表的新 kwargs；未注入时 None（调用方保持原载荷）。
+        """
+        if self._screen_store is None:
+            return None
+
+        items = kwargs.get("items")
+        messages = kwargs.get("messages")
+        if isinstance(items, list) and items:
+            payload_key, payload = "items", items
+        elif isinstance(messages, list) and messages:
+            payload_key, payload = "messages", messages
+        else:
+            return None
+
+        modified = self._apply_screen_narration(
+            payload, str(kwargs.get("session_id") or ""), channel
+        )
+        if modified is None:
+            return None
+        return {**kwargs, payload_key: modified}
+
+    def _apply_screen_narration(
+        self, payload: list[Any], session_id: str, channel: str
+    ) -> Optional[list[Any]]:
+        """按「尾随锚点」把旁白插到锚点消息之后；不注入时返回 None。
+
+        注入作用域：**只对恋人私聊流生效**。判定复用 :meth:`_resolve_injection_scope`
+        ——只有 ``private`` 档才继续，群聊（哪怕开了群聊注入）与其他会话一律跳过，
+        确保屏幕内容不会漏到非恋人的聊天流里。
+
+        Args:
+            payload: 上下文条目列表（本方法返回浅拷贝，不改动入参）。
+            session_id: 本次请求的会话 ID。
+            channel: 通道名（planner / replyer）。
+
+        Returns:
+            插入旁白后的新列表；未注入时 None。
+        """
+        if not payload:
+            return None
+        if self._resolve_injection_scope(session_id, payload) != self.INJECT_SCOPE_PRIVATE:
+            return None
+
+        taken = self._screen_store.take_injection(session_id, channel, payload)
+        if taken is None:
+            return None
+        insert_at, text = taken
+
+        anchor = payload[insert_at - 1] if 0 < insert_at <= len(payload) else None
+        item = build_narration_item(text, anchor, now=datetime.now())
+        new_payload = list(payload)
+        new_payload.insert(insert_at, item)
+        return new_payload
+
+    # ── [LOCAL-PATCH:cateye] v2.5.0 注入作用域 ────────────────────────────
+
+    async def _build_activity_suffix(self, scope: str) -> str:
+        """构造注入文本。
+
+        Args:
+            scope: :meth:`_resolve_injection_scope` 的结果。
+                ``skip`` 时只注入中性的日期行。
+        """
         now = datetime.now()
         current_date = now.strftime("%Y-%m-%d")
         weekday = "一二三四五六日"[now.weekday()]
         holiday_info = await self._holiday_svc.get_holiday_info(current_date)
-        current_time = now.strftime("%H:%M")
-        name = self._get_lover_name()
-        affection_level = self._affection_mgr.level() if self._affection_mgr else 0
-        affection_desc = AFFECTION_DESCRIPTIONS.get(affection_level, "")
 
         suffix = f"\n【当前日期】今天是 {current_date}（星期{weekday}），{holiday_info}。"
+        if scope == self.INJECT_SCOPE_SKIP:
+            return suffix
+
+        current_time = now.strftime("%H:%M")
+        name = self._get_lover_name()
+        target_label = self._target_label()
+        affection_level = self._affection_mgr.level() if self._affection_mgr else 0
+        affection_desc = AFFECTION_DESCRIPTIONS.get(affection_level, "")
 
         # v2.3.0：无日程时不注入日程状态。外部日程模式下，自主规划插件
         # 无睡眠时段不生成日程、凌晨日切后当日日程也可能尚未生成——
@@ -400,8 +624,110 @@ class MaiLoverPlugin(MaiBotPlugin):
         else:
             self.ctx.logger.debug("当前无日程（外部日程可能未生成/时段无安排），跳过日程状态注入")
 
-        suffix += f"\n【{name}对用户的好感度】档位 {affection_level}（{affection_desc}）"
+        suffix += (
+            f"\n【{name}对用户 {target_label}的好感度】档位 {affection_level}（{affection_desc}）"
+        )
+        # 私聊档不加范围说明："这只是谁的会话"由会话本身决定，上下文里没有第三方，
+        # 多说一句只是白烧 token；只有群聊档才需要把恋人语气限定在这一位身上。
+        if scope == self.INJECT_SCOPE_GROUP:
+            suffix += (
+                f"\n（当前是群聊：上述好感度与恋人语气仅在与{target_label}直接互动时使用；"
+                f"对群里其他人保持普通、有分寸的关系，不要因为 TA 在场就忽略其他人。）"
+            )
         return suffix
+
+    def _resolve_injection_scope(self, session_id: str, payload: list[Any]) -> str:
+        """判断本次 planner 请求该注入哪一档上下文。
+
+        规则（v2.5.0）：
+
+        1. ``session_id`` 等于已解析出的目标私聊 stream_id → ``private``；
+        2. 已知是私聊（会话类型 ``False``）且最近一条用户消息的发送者 QQ 号就是目标
+           用户 → ``private``（宿主重建会话导致 stream_id 变化时的兜底）；
+        3. 已知是群聊（会话类型 ``True``）、打开了
+           ``injection.group_affection_enabled``，且最近
+           ``injection.group_recent_user_messages`` 条用户消息里出现过目标用户的
+           **QQ 号** → ``group``；
+        4. 其余一律 ``skip``（只注入日期）。
+
+        判定**只看 QQ 号**：昵称与群名片任何人都能改，按名字判定会被
+        「某某的小号」这类名字误命中。消息发送者由 ``msg_id`` 反查
+        :class:`SenderCache` 得到（见 :meth:`on_receive_before_process`）；
+        反查不到（插件启动前的历史消息、缓存淘汰）或会话类型未知时按 ``skip`` 处理
+        —— fail-safe：宁可漏注入，也不能把私聊恋人设定撒到群里。
+
+        Args:
+            session_id: Hook 载荷里的会话 ID（宿主里与 stream_id 同值）。
+            payload: 当前上下文条目列表（用于回看最近用户消息）。
+
+        Returns:
+            ``private`` / ``group`` / ``skip``。
+        """
+        sid = str(session_id or "").strip()
+        target_stream = str(self._cached_stream_id or "").strip()
+        target_qq = self._target_qq()
+        if target_stream and sid and sid == target_stream:
+            return self.INJECT_SCOPE_PRIVATE
+
+        is_group = self._session_kinds.is_group(sid)
+
+        # 私聊兜底：stream_id 变了（宿主重建会话）但对方确实是目标用户
+        if (
+            is_group is False
+            and target_qq
+            and self._recent_sender_ids(payload, 1)[-1:] == [target_qq]
+        ):
+            self.ctx.logger.debug(
+                f"私聊 stream_id 与缓存不一致，按最近一条私聊消息的发送者 QQ 认亲: {target_qq}"
+            )
+            return self.INJECT_SCOPE_PRIVATE
+
+        injection_cfg = getattr(self.config, "injection", None)
+        if injection_cfg is None or not getattr(
+            injection_cfg, "group_affection_enabled", False
+        ):
+            self.ctx.logger.debug(
+                f"非目标私聊（session_id={sid or '未知'}），只注入日期行"
+            )
+            return self.INJECT_SCOPE_SKIP
+
+        if is_group is not True or not target_qq:
+            self.ctx.logger.debug(
+                f"会话 {sid or '未知'} 不是已知群聊（is_group={is_group}），群聊注入跳过"
+            )
+            return self.INJECT_SCOPE_SKIP
+
+        window = int(getattr(injection_cfg, "group_recent_user_messages", 15) or 15)
+        if target_qq not in self._recent_sender_ids(payload, window):
+            self.ctx.logger.debug(
+                f"群聊注入跳过：最近 {window} 条用户消息里没有目标用户（QQ {target_qq}）"
+            )
+            return self.INJECT_SCOPE_SKIP
+        return self.INJECT_SCOPE_GROUP
+
+    def _target_qq(self) -> str:
+        """目标用户 QQ 号（未配置或仍是默认占位值时返回空串）。"""
+        target_qq = str(self.config.whitelist.target_qq or "").strip()
+        return "" if target_qq in ("", "0") else target_qq
+
+    def _recent_sender_ids(self, payload: list[Any], window: int) -> list[str]:
+        """上下文里最后 ``window`` 条用户消息的发送者 QQ 号（反查不到为空串）。"""
+        return sender_ids_in_window(payload, self._senders, window)
+
+    def _target_label(self) -> str:
+        """注入文案里用于标注"这是谁"的标签，如 ``小美（QQ 100000000）``。
+
+        昵称/群名片只在这里露面（展示用），**判定一律不看它们**。
+        """
+        target_qq = self._target_qq()
+        nickname = str(
+            self._cached_target_nickname or self._cached_target_cardname or ""
+        ).strip()
+        if nickname and target_qq:
+            return f"{nickname}（QQ {target_qq}）"
+        if target_qq:
+            return f"QQ {target_qq}"
+        return nickname or "恋人"
 
     @staticmethod
     def _inject_context_message(
@@ -711,8 +1037,14 @@ class MaiLoverPlugin(MaiBotPlugin):
         t = self.config.time_windows
         p = self.config.probability
         a = self.config.affection
+        i = self.config.injection
         schedule_source = "外部（自主规划插件）" if s.use_external_schedule else "本插件自动生成"
         miss_llm = "开" if getattr(t, "miss_llm_check_enabled", False) else "关"
+        scope_text = (
+            f"含群聊（回看 {i.group_recent_user_messages} 条用户消息）"
+            if i.group_affection_enabled
+            else "仅目标私聊"
+        )
         return (
             "⚙️ 麦麦恋人配置: "
             f"巡检间隔 {s.check_interval_minutes}min | "
@@ -728,6 +1060,7 @@ class MaiLoverPlugin(MaiBotPlugin):
             f"想念概率 {p.miss_speak_rate} | "
             f"日程节点概率 {p.activity_trigger_rate} | "
             f"好感度 {a.current_level} | "
+            f"恋人上下文注入 {scope_text} | "
             f"模型 {self.config.plugin.llm_model}"
         )
 
@@ -902,8 +1235,14 @@ class MaiLoverPlugin(MaiBotPlugin):
         t = self.config.time_windows
         p = self.config.probability
         a = self.config.affection
+        i = self.config.injection
         schedule_source = "外部（自主规划插件）" if s.use_external_schedule else "本插件自动生成"
         miss_llm = "开" if getattr(t, "miss_llm_check_enabled", False) else "关"
+        inject_scope = (
+            f"目标私聊 + 群聊（回看 {i.group_recent_user_messages} 条）"
+            if i.group_affection_enabled
+            else "仅目标私聊"
+        )
         summary = (
             "⚙️ 麦麦恋人配置摘要\n"
             f"调度: 巡检间隔 {s.check_interval_minutes}min | "
@@ -920,6 +1259,7 @@ class MaiLoverPlugin(MaiBotPlugin):
             f"想念 {p.miss_speak_rate} | "
             f"日程节点 {p.activity_trigger_rate}\n"
             f"好感度: {a.current_level} | "
+            f"恋人上下文注入: {inject_scope} | "
             f"模型: {self.config.plugin.llm_model}"
         )
         try:
@@ -1483,6 +1823,10 @@ class MaiLoverPlugin(MaiBotPlugin):
         使用 SDK 提供的 chat 代理，不直接访问 MaiBot 内部数据库。
         所有层级均做 try/except 降级保护。
 
+        v2.5.0：顺带把返回里的 ``user_nickname`` / ``user_cardname`` 缓存下来，
+        用于注入文案标注用户与群聊注入判定（宿主给群消息标注的是昵称/群名片，
+        不是 QQ 号）。
+
         Args:
             target_qq: 目标 QQ 号。
 
@@ -1494,8 +1838,10 @@ class MaiLoverPlugin(MaiBotPlugin):
             stream_info = await self.ctx.chat.get_stream_by_user_id(
                 user_id=target_qq
             )
-            if isinstance(stream_info, dict) and stream_info.get("stream_id"):
-                sid = str(stream_info["stream_id"])
+            info = self._stream_payload(stream_info)
+            if isinstance(info, dict) and info.get("stream_id"):
+                sid = str(info["stream_id"])
+                self._remember_stream_identity(info)
                 self.ctx.logger.debug(f"从 get_stream_by_user_id 获取 stream_id: {sid}")
                 return sid
         except Exception as e:
@@ -1504,22 +1850,78 @@ class MaiLoverPlugin(MaiBotPlugin):
         # 方法2: 遍历 get_private_streams
         try:
             streams = await self.ctx.chat.get_private_streams()
-            if isinstance(streams, list):
-                for s in streams:
-                    if isinstance(s, dict) and str(s.get("user_id", "")) == str(target_qq):
-                        sid = str(s.get("stream_id", ""))
-                        self.ctx.logger.debug(f"从 get_private_streams(list) 获取 stream_id: {sid}")
-                        return sid
-            elif isinstance(streams, dict):
-                for key, s in streams.items():
-                    if isinstance(s, dict) and str(s.get("user_id", "")) == str(target_qq):
-                        sid = str(s.get("stream_id", key))
-                        self.ctx.logger.debug(f"从 get_private_streams(dict) 获取 stream_id: {sid}")
-                        return sid
+            for key, s in self._iter_stream_candidates(streams):
+                if not isinstance(s, dict):
+                    continue
+                if str(s.get("user_id", "")) == str(target_qq):
+                    sid = str(s.get("stream_id") or key or "")
+                    if not sid:
+                        continue
+                    self._remember_stream_identity(s)
+                    self.ctx.logger.debug(f"从 get_private_streams 获取 stream_id: {sid}")
+                    return sid
         except Exception as e:
             self.ctx.logger.error(f"get_private_streams 失败: {e}")
 
         return ""
+
+    @staticmethod
+    def _stream_payload(payload: Any) -> Any:
+        """把 ``{"success": true, "stream": {...}}`` 这类包装拆到内层流信息。
+
+        宿主不同版本对 ``chat.get_stream_by_user_id`` 的返回形状不一致
+        （有的把 stream_id 平铺在顶层，有的包在 ``stream``/``session`` 里），
+        这里统一兼容。
+        """
+        if not isinstance(payload, dict):
+            return payload
+        for key in ("stream", "session", "data"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                return nested
+        return payload
+
+    @staticmethod
+    def _iter_stream_candidates(payload: Any) -> list[tuple[str, Any]]:
+        """把 list / dict / ``{"streams": [...]}`` 三种形状统一成 (key, item) 列表。"""
+        if isinstance(payload, list):
+            return [("", item) for item in payload]
+        if not isinstance(payload, dict):
+            return []
+        for key in ("streams", "data", "items", "list"):
+            nested = payload.get(key)
+            if isinstance(nested, list):
+                return [("", item) for item in nested]
+            if isinstance(nested, dict):
+                payload = nested
+                break
+        return [(str(key), value) for key, value in payload.items()]
+
+    def _remember_stream_identity(self, info: Any) -> None:
+        """缓存目标用户的昵称/群名片（拿不到就保留旧值）。"""
+        if not isinstance(info, dict):
+            return
+        nickname = info.get("user_nickname") or info.get("nickname")
+        cardname = info.get("user_cardname") or info.get("cardname")
+        if isinstance(nickname, str) and nickname.strip():
+            self._cached_target_nickname = nickname.strip()
+        if isinstance(cardname, str) and cardname.strip():
+            self._cached_target_cardname = cardname.strip()
+        self._sync_target_display_name()
+
+    def _sync_target_display_name(self) -> None:
+        """把目标用户显示名同步给调度器（屏幕旁白文案里写「你看了眼 X 的电脑屏幕」）。
+
+        只取昵称/群名片（**不带 QQ 号**——旁白是口语化文案，写 QQ 号很出戏）；
+        都拿不到时留空，由 :mod:`screen_context` 回退成「恋人」。
+        """
+        if self._scheduler is None:
+            return
+        name = str(
+            self._cached_target_nickname or self._cached_target_cardname or ""
+        ).strip()
+        if name:
+            self._scheduler.set_target_display_name(name)
 
     async def _start_scheduler(self) -> None:
         """解析 stream_id 并启动调度器。

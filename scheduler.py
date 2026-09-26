@@ -23,6 +23,18 @@ v2.4.2（cateye 维护）:
   「不触发」处理（fail-safe，宁可不发）；
 - 每轮巡检的判定结论写入「主动行为决策日志」（``decision_logger``），可回答
   "为什么又发了 / 今天怎么没发"。
+
+v2.6.0（cateye 维护）——「先看屏幕，再叫醒 planner」：
+- 屏幕感知（截图 + 视觉转述）从「拼进 reason 提示词」改为**统一在触发时取一次**，
+  由 :meth:`Scheduler._publish_screen_narration` 发布到 ``screen_context`` 缓存，
+  再由 planner / replyer 的请求 Hook 以「尾随锚点」方式写进上下文
+  （详见 ``screen_context`` 模块说明）；
+- 触发范围扩大到**全部**主动触发：早安 / 晚安 / 想念 / 日程节点分享 / 日常巡检
+  （此前只有早晚安与想念会看屏幕）；
+- 想念的屏幕感知移到 **LLM 把关之后**（原先在把关前取，被驳回就白截一张）；
+- 新增 ``time_windows.miss_avoid_future_schedule``（默认关闭）：此前"未来 2 小时内有
+  日程节点就不打扰想念"是硬编码，外部日程模式下会让想念**永不触发**；现在默认放行，
+  需要旧行为可手动打开，窗口长度由 ``miss_future_schedule_hours`` 控制。
 """
 
 import asyncio
@@ -38,8 +50,15 @@ from .decision_logger import (
     ACTION_TRIGGER,
     ProactiveDecisionLogger,
 )
+from .cateye_client import PEEK_OFFLINE
+from .constants import (
+    SCREEN_FAILED_NARRATION_TEMPLATE_DEFAULT,
+    SCREEN_NARRATION_TEMPLATE_DEFAULT,
+    SCREEN_OFFLINE_NARRATION_TEMPLATE_DEFAULT,
+)
 from .llm_service import LLMService
 from .schedule_generator import ScheduleGenerator
+from .screen_context import ScreenContextStore, format_narration
 
 # 想念被 LLM 驳回后，多久之内不再重复发起把关判断（分钟）
 MISS_REJECT_COOLDOWN_MINUTES = 30.0
@@ -96,6 +115,7 @@ class Scheduler:
         llm_service: Optional[LLMService] = None,
         cateye_client: Optional[Any] = None,
         decision_logger: Optional[ProactiveDecisionLogger] = None,
+        screen_store: Optional[ScreenContextStore] = None,
     ) -> None:
         """初始化调度器。
 
@@ -107,6 +127,7 @@ class Scheduler:
             llm_service: LLM 服务（想念触发的 LLM 把关用；None = 跳过把关）。
             cateye_client: 恋人电脑联动客户端（None = 不查看电脑状态）。
             decision_logger: 主动行为决策日志（None = 不记录）。
+            screen_store: 屏幕旁白缓存（v2.6.0；None = 不注入屏幕感知）。
         """
         self._ctx: Any = ctx
         self._config: MaiLoverPluginSettings = config
@@ -115,11 +136,14 @@ class Scheduler:
         self._llm: Optional[LLMService] = llm_service
         self._cateye: Optional[Any] = cateye_client
         self._decision_logger: Optional[ProactiveDecisionLogger] = decision_logger
+        self._screen_store: Optional[ScreenContextStore] = screen_store
         self._stop_event: asyncio.Event = asyncio.Event()
         self._target_qq: str = ""
         self._stream_id: str = ""
         self._personality: str = ""
         self._lover_name: str = "麦麦"
+        # v2.6.0：目标用户显示名（屏幕旁白里写「你看了眼 X 的电脑屏幕」用）
+        self._target_display_name: str = ""
         self._last_trigger_time: Optional[datetime] = None
         self._miss_last_reject_at: Optional[datetime] = None
         # 非法时间窗口配置的告警节流：配置项 -> 已告警过的原始值
@@ -164,6 +188,18 @@ class Scheduler:
         """
         if name:
             self._lover_name = name
+
+    def set_target_display_name(self, name: str) -> None:
+        """设置目标用户显示名（屏幕旁白文案用）。
+
+        由 plugin 在 on_load / on_config_update / 解析私聊流时传入；
+        取不到时旁白退回「恋人」。
+
+        Args:
+            name: 目标用户昵称（不要带 QQ 号，旁白是口语化文案）。
+        """
+        if name:
+            self._target_display_name = str(name).strip()
 
     def get_last_trigger_time(self) -> Optional[datetime]:
         """返回上次成功 proactive trigger 的时间。"""
@@ -537,8 +573,13 @@ class Scheduler:
                         f"（区间 {self._config.time_windows.miss_trigger_hours_min}"
                         f"~{self._config.time_windows.miss_trigger_hours_max}h）",
                     )
-                elif self._has_future_schedule(2, now):
-                    mark_skip("future_schedule", "miss", "未来 2 小时内有日程节点，先不打扰")
+                elif self._avoid_future_schedule_for_miss(now):
+                    mark_skip(
+                        "future_schedule",
+                        "miss",
+                        f"未来 {self._miss_future_schedule_hours():g} 小时内有日程节点，先不打扰"
+                        "（可在「时间窗口 → 想念避开未来日程」关掉）",
+                    )
                 elif self._affection.today_speak_count() >= non_night_budget:
                     mark_skip(
                         "budget",
@@ -556,16 +597,15 @@ class Scheduler:
                 elif random.random() >= miss_speak_rate:
                     mark_skip("dice", "miss", f"想念概率未通过（miss_speak_rate={miss_speak_rate}）")
                 else:
-                    # 电脑状态本次巡检只取一份：把关与触发复用，
-                    # 避免一次触发连截两张屏
-                    computer_context = await self._get_computer_context(now)
                     # LLM 把关：以角色身份判断此刻开口是否自然，
-                    # 驳回则本轮不触发（30 分钟冷却内不重复判断）
+                    # 驳回则本轮不触发（30 分钟冷却内不重复判断）。
+                    # v2.6.0：屏幕感知挪到把关之后（_trigger_planner 内统一取），
+                    # 被驳回就不会白截一张屏。
                     if self._miss_llm_check_enabled() and not await self._confirm_missing_with_llm(
-                        hours_since_last, now, computer_context
+                        hours_since_last, now
                     ):
                         mark_skip("llm_rejected", "miss", "LLM 把关驳回（30 分钟内不重复判断）")
-                    elif await self._trigger_missing(hours_since_last, computer_context):
+                    elif await self._trigger_missing(hours_since_last):
                         mark_trigger("miss", f"想念触发已入队（用户沉默 {hours_since_last:.1f}h）")
                     else:
                         mark_skip(
@@ -662,6 +702,11 @@ class Scheduler:
     async def _trigger_planner(self, intent: str, reason: str) -> bool:
         """统一触发 planner 主动处理。
 
+        v2.6.0：所有主动触发在叫醒 planner **之前**先看一眼恋人电脑，把屏幕转述
+        发布到上下文注入缓存（``screen_context``）——此时 planner 还没被激活，
+        等 VLM 返回、旁白挂好之后再 ``proactive.trigger``。旁白不再拼进 ``reason``，
+        由 planner / replyer 的请求 Hook 以「尾随锚点」方式写进上下文。
+
         Args:
             intent: 触发意图（"morning"/"night"/"missing"/"daily"/"activity"）
             reason: 传给 planner 的提示文本
@@ -673,61 +718,152 @@ class Scheduler:
             return False
         if not self._config.schedule.proactive_trigger_enabled:
             return False
+        await self._publish_screen_narration()
         try:
-            await self._ctx.maisaka.proactive.trigger(
+            result = await self._ctx.maisaka.proactive.trigger(
                 stream_id=self._stream_id,
                 intent=intent,
                 reason=reason,
             )
+            # 入队失败（如「未找到已存在的聊天流」）时把刚发布的旁白撤掉：
+            # 否则它会一直躺在缓存里，被之后某轮**普通对话**的请求锚上并注入。
+            if isinstance(result, dict) and result.get("success") is False:
+                self._ctx.logger.error(
+                    f"proactive_trigger 未入队: {result.get('error') or result}"
+                )
+                self._discard_screen_narration()
+                return False
             self._affection.increment_speak(0.5)  # 先计 0.5，replyer 回复后再补 0.5
             self._last_trigger_time = datetime.now()
             self._last_trigger_intent = str(intent or "")
             return True
         except Exception as e:
             self._ctx.logger.error(f"proactive_trigger 失败: {e}")
+            self._discard_screen_narration()
             return False
 
     async def _trigger_morning(self) -> bool:
-        """触发早安 planner（触发前看一眼恋人的电脑）；返回是否入队成功。"""
+        """触发早安 planner（屏幕感知由 _trigger_planner 统一取）；返回是否入队成功。"""
         self._ctx.logger.info("S级触发: 早安")
-        reason = "早上好，可以说早安" + await self._get_computer_context(datetime.now())
-        success = await self._trigger_planner("morning", reason)
+        success = await self._trigger_planner("morning", "早上好，可以说早安")
         if success:
             self._affection.set_morning_sent()
         return success
 
     async def _trigger_night(self) -> bool:
-        """触发晚安 planner（触发前看一眼恋人的电脑）；返回是否入队成功。"""
+        """触发晚安 planner（屏幕感知由 _trigger_planner 统一取）；返回是否入队成功。"""
         self._ctx.logger.info("S级触发: 晚安")
-        reason = "晚上好，可以说晚安" + await self._get_computer_context(datetime.now())
-        success = await self._trigger_planner("night", reason)
+        success = await self._trigger_planner("night", "晚上好，可以说晚安")
         if success:
             self._affection.set_night_sent()
         return success
 
-    async def _trigger_missing(
-        self, hours_since_last: float, computer_context: str = ""
-    ) -> bool:
-        """触发想念 planner；返回是否入队成功。
+    async def _trigger_missing(self, hours_since_last: float) -> bool:
+        """触发想念 planner（屏幕感知由 _trigger_planner 统一取）；返回是否入队成功。
 
         Args:
             hours_since_last: 距用户最后一条消息的小时数（填入 reason 提示词）。
-            computer_context: 恋人电脑状态文案（把关与触发复用同一份，避免重复截图）。
         """
         self._ctx.logger.info(
             f"A级触发: 想念机制（沉默 {hours_since_last:.1f} 小时）"
         )
-        reason = self._format_miss_reason(hours_since_last) + computer_context
+        reason = self._format_miss_reason(hours_since_last)
         success = await self._trigger_planner("missing", reason)
         if success:
             self._affection.set_miss_sent()
         return success
 
-    async def _get_computer_context(self, now: datetime) -> str:
-        """获取恋人电脑状态文案（未启用联动 / 无客户端时返回空串）。"""
-        if self._cateye is None or not self._cateye.is_enabled():
-            return ""
-        return await self._cateye.get_computer_context(now)
+    # ── v2.6.0：屏幕感知 ──────────────────────────────────────────────
+
+    async def _publish_screen_narration(self) -> None:
+        """看一眼恋人电脑，把屏幕旁白发布到上下文注入缓存。
+
+        三种结果分别对应 ``[cateye]`` 的三个模板，**对应模板留空 = 这种情况不注入**：
+
+        ==================  ==========================  ==============================
+        看的结果            配置项                       默认文案
+        ==================  ==========================  ==============================
+        看清楚              ``narration_template``      …你看了眼{user_name}的电脑屏幕，TA正在：{description}
+        电脑没开            ``offline_narration_template``  …你想看一眼{user_name}的电脑屏幕，但TA的电脑没开
+        看不成（截图/理解）  ``failed_narration_template``   …你看了眼{user_name}的电脑屏幕，但没看清TA在干什么
+        ==================  ==========================  ==============================
+
+        「电脑没开 / 没看清」是 v2.5.0 就有的语义，v2.6.0 只是把它从「拼进 planner 提示词」
+        改成「走同一条旁白通道」，所以麦麦照样知道"这次没看到"，但不再有额外提示词。
+
+        功能关闭 / 整体超时 / 任何异常 → 不注入（与 v2.5.0 一致），
+        且绝不阻塞主动触发——因此**整个函数体都在 try 里**。
+        """
+        try:
+            if self._screen_store is None or self._cateye is None:
+                return
+            now = datetime.now()
+            peek = await self._cateye.peek_screen(now)
+            if peek is None:
+                return
+
+            cateye_cfg = getattr(self._config, "cateye", None)
+            if peek.ok:
+                template = str(getattr(cateye_cfg, "narration_template", "") or "")
+                default_template = SCREEN_NARRATION_TEMPLATE_DEFAULT
+            elif peek.status == PEEK_OFFLINE:
+                template = str(
+                    getattr(cateye_cfg, "offline_narration_template", "") or ""
+                )
+                default_template = SCREEN_OFFLINE_NARRATION_TEMPLATE_DEFAULT
+            else:
+                template = str(
+                    getattr(cateye_cfg, "failed_narration_template", "") or ""
+                )
+                default_template = SCREEN_FAILED_NARRATION_TEMPLATE_DEFAULT
+
+            if not template.strip():
+                self._ctx.logger.debug(
+                    f"屏幕旁白模板留空（{peek.status}），本轮不注入屏幕感知"
+                )
+                return
+
+            text = format_narration(
+                template,
+                now=now,
+                user_name=self._target_display_name,
+                description=peek.description,
+                default_template=default_template,
+            )
+            if self._screen_store.publish(self._stream_id, text):
+                self._ctx.logger.info(
+                    f"屏幕感知已挂入上下文注入缓存（stream={self._stream_id}，"
+                    f"{peek.status}）：{text}"
+                )
+        except Exception as e:  # noqa: BLE001 —— 锦上添花，绝不阻塞触发
+            self._ctx.logger.warning(f"发布屏幕旁白失败（忽略）: {e}")
+
+    def _discard_screen_narration(self) -> None:
+        """撤掉本流上待注入的屏幕旁白（触发未入队 / 抛异常时调用）。"""
+        if self._screen_store is not None:
+            self._screen_store.discard(self._stream_id)
+
+    def _miss_future_schedule_hours(self) -> float:
+        """想念「避开未来日程」的窗口长度（小时，配置缺字段时回退 2.0）。"""
+        tw = getattr(self._config, "time_windows", None)
+        try:
+            return max(0.0, float(getattr(tw, "miss_future_schedule_hours", 2.0)))
+        except (TypeError, ValueError):
+            return 2.0
+
+    def _avoid_future_schedule_for_miss(self, now: datetime) -> bool:
+        """想念是否要因为"未来有日程"而本轮不打扰（v2.6.0 起默认关闭）。
+
+        关闭（默认）时恒返回 False = 不看日程。此前这是硬编码的 2 小时窗口，
+        在外部日程（节点密集）模式下会让想念**永远不触发**。
+        """
+        tw = getattr(self._config, "time_windows", None)
+        if not bool(getattr(tw, "miss_avoid_future_schedule", False)):
+            return False
+        hours = self._miss_future_schedule_hours()
+        if hours <= 0:
+            return False
+        return self._has_future_schedule(hours, now)
 
     # ── 想念机制辅助（v2.3.0）────────────────────────────────────────
 
@@ -792,18 +928,19 @@ class Scheduler:
         self,
         hours_since_last: float,
         now: datetime,
-        computer_context: str = "",
     ) -> bool:
         """想念触发前的 LLM 把关：此刻主动表达想念是否自然。
 
         用配置的 ``miss_confirm_prompt`` 模板构造提示词（含沉默时长、当前
-        时间、当前活动与恋人电脑状态），LLM 回复 Y 才放行；N、无法解析或
-        调用失败一律视为驳回——宁可这轮不打扰，也不硬接话题。
+        时间与当前活动），LLM 回复 Y 才放行；N、无法解析或调用失败一律视为
+        驳回——宁可这轮不打扰，也不硬接话题。
+
+        v2.6.0：不再带上恋人电脑状态——屏幕感知挪到了把关通过之后
+        （:meth:`_trigger_planner` 统一取），被驳回就不会白截一张屏。
 
         Args:
             hours_since_last: 距用户最后一条消息的小时数。
             now: 当前时间（复用 _tick 的 now）。
-            computer_context: 恋人电脑状态文案（"" = 未启用联动）。
 
         Returns:
             True = 放行触发；False = 驳回（新鲜驳回时记录驳回时间，
@@ -837,9 +974,6 @@ class Scheduler:
                 hours=f"{hours_since_last:.1f}",
                 activity_context=activity_context,
             )
-        if computer_context:
-            prompt += f"\n{computer_context}"
-
         assert self._llm is not None  # _miss_llm_check_enabled 已保证
         response = await self._llm.generate(
             prompt=prompt, temperature=0.2, max_tokens=16, event="miss_confirm"
@@ -1049,11 +1183,11 @@ class Scheduler:
         except ValueError:
             return False
 
-    def _has_future_schedule(self, hours: int, now: datetime) -> bool:
+    def _has_future_schedule(self, hours: float, now: datetime) -> bool:
         """检查未来指定小时内是否有日程节点。
 
         Args:
-            hours: 未来时间窗口（小时数）。
+            hours: 未来时间窗口（小时数，可带小数）。
             now: 当前时间（复用 _tick 的 now）。
 
         Returns:

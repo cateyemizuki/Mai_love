@@ -10,6 +10,188 @@
 > - 插件 ID `maibot-community.mai-love` **保持不变**，其他插件依赖它调用公开 API。
 > - 本 fork 的 2.3.0 – 2.4.0 改动已在 README「Fork 改动说明」中按版本记录；本文件自 v2.4.1 起接管版本变更记录。
 
+## [2.6.0] - 2026-09-26
+
+**主题：先看屏幕，再叫醒 planner；顺便把「想念永远不触发」放出来。**
+
+### 变更（Changed）
+
+- **屏幕感知改成「先 VLM，再激活 planner」**。原先的做法是把转述文本拼进
+  `proactive.trigger` 的 `reason` 提示词，等于往 planner 里塞一段说明；现在改为：
+  触发时先取屏幕（截图 + 视觉转述），把旁白发布到新的 `screen_context` 缓存，
+  **然后**才调 `maisaka.proactive.trigger`（`reason` 里不再含电脑状态）。
+- **屏幕感知覆盖全部主动触发**：早安 / 晚安 / 想念 / 日程节点分享 / 日常巡检。
+  此前只有早晚安与想念会看屏幕（`_trigger_morning` / `_trigger_night` / 想念分支
+  各自调用），日程节点与日常巡检完全不看。
+- **想念的屏幕感知挪到 LLM 把关之后**：原先把关前就截图，被驳回等于白截一张；
+  现在统一由 `_trigger_planner` 在真正触发时取。副作用是
+  `_confirm_missing_with_llm` 不再收到电脑状态（该参数已移除），
+  把关提示词里少了一行「TA 在不在电脑前」的参考信息。
+- `[cateye]` 新增四个配置项，旁白**不再由代码写死**：
+  - `narration_template`（看清楚时，占位符 `{date}` / `{time}` / `{user_name}` / `{description}`）；
+  - `offline_narration_template`（电脑没开时，占位符同上但无 `{description}`）；
+  - `failed_narration_template`（截图/理解失败时，同上）；
+  - `context_ttl_minutes`（旁白存活上限，默认 90 分钟，0 = 不限）。
+- **「电脑没开 / 没看清」保留，但换通道**：v2.5.0 是把
+  `（恋人的电脑没开）` / `（恋人的电脑开着，但没看清TA在干什么）` 拼进 `reason`；
+  v2.6.0 改为走同一条旁白通道（三个模板对应三种看屏幕结果）。
+  语义不变（麦麦照样知道"这次没看到"），但 planner 提示词里不再多一段说明。
+  对应模板**留空 = 那种情况不注入**（只想要"看清楚了"就清空后两项）；
+  功能关闭 / 整体超时仍按不注入处理（与 v2.5.0 一致）。
+- `cateye_client` 的返回值从「字符串」改为 `ScreenPeek` 状态对象
+  （`ok` / `offline` / `failed`）——"看不成"现在要分两种说法，调用方需要区分，
+  不能再靠"空串 = 没看成"来猜。
+- `[cateye] enabled` 的说明改为「每次主动触发时查看 + 三种结果各自的旁白」，
+  不再写「想念/早晚安触发时」。
+
+### 新增（Added）
+
+- **`screen_context.py`：屏幕旁白的「尾随锚点」注入**。
+  旁白不是一次性追加进宿主历史，而是**请求级**注入：
+  1. 触发时 `publish(stream_id, text)`；
+  2. 之后**每一轮** planner / replyer 请求，在载荷 `items` 里定位锚点
+     ——触发那一刻上下文里**最后一条真实聊天消息**（用户或 bot 发的）。
+     排除项：宿主的 `<plugin_proactive_task>` 插件块、本插件自己注入的旁白、
+     system/工具/推理/参考消息条目，以及**宿主每轮重建的「合成 user 条目」**
+     （当前时间、planner 最终提醒、replyer 回复要求——它们 `item_id` 每轮都是新 uuid，
+     一旦被当成锚点，第二轮就找不回来，旁白只会注入一轮）。判据是真实用户消息带
+     `<message msg_id="…">` 前缀，合成条目没有；
+  3. 找到就把旁白作为一条 **`AssistantMessageItem`（bot 身份）** 插到锚点**之后**；
+  4. 某通道的上下文里锚点消失了（一般是超出上下文条数）→ **只作废该通道**；
+     planner 与 replyer 的上下文不一定相同，因此**分开识别、分开失效**，
+     两者都作废后整条缓存清除，此后不再扫描；
+  5. 另有 `context_ttl_minutes` 兜底，避免几小时后还把「TA 正在写代码」当成现在的事。
+  - 为什么不直接 `ctx.maisaka.context.append`：它是**持久**追加进
+    `runtime._chat_history` 的 user 角色消息，会长期占一个上下文槽位，
+    也可能把真实消息挤掉；请求级注入不污染宿主历史。
+  - 为什么不走 MessageGateway「入库不真发」：私聊的 `session_id` 由**发送者**
+    `user_id` 决定（`utils_session.py`），`user_id=机器人自己` 算出来的是
+    「bot 跟自己聊天」的幽灵流，**进不了恋人的私聊流**；而 `is_notify=True`
+    的记录又会在宿主恢复上下文时被 `continue` 跳过，planner 读不到。
+  - 新增 Hook `maisaka.replyer.before_model_request`（旁白注入），
+    `maisaka.planner.before_request` 同步支持。
+- **`time_windows.miss_avoid_future_schedule`（默认 false）** 与
+  `time_windows.miss_future_schedule_hours`（默认 2.0）：
+  「未来 2 小时内有日程节点就先不打扰想念」此前是**硬编码**（`scheduler.py` 里
+  写死的 `_has_future_schedule(2, now)`）。外部日程模式下节点密集，
+  这道闸门几乎恒为真，再叠加「主动发言最小间隔 240 分钟」与晚安窗口，
+  想念**实际上永远不会触发**（30 天 × 每 10 分钟一 tick 的仿真：
+  `min_interval=120` 时 miss 命中 0 次，`=0/30` 时才命中 17 次）。
+  现在默认关闭 = 放行想念；需要旧行为可手动打开，窗口长度可配。
+
+### 移除（Removed）
+
+- `cateye_client.get_computer_context()` 与其 `TEXT_COMPUTER_OFFLINE` /
+  `TEXT_COMPUTER_BLURRED` 两个常量删除，改为 `peek_screen()` + `ScreenPeek`
+  （两个常量的文案成为 `[cateye] offline_narration_template` /
+  `failed_narration_template` 的默认值，见「变更」）。
+
+### 修复（Fixed）
+
+- **锚点被宿主的「合成 user 条目」抢走**（自检阶段发现）：宿主在 planner / replyer
+  载荷末尾会追加一批 `ContextItemBuilder` 现造的 user 条目（当前时间、最终提醒、
+  回复要求），它们文本非空、`item_id` 每轮都是新 uuid，会被误判成"真实消息"当上锚点，
+  下一轮找不回来 → 旁白实际只注入一轮。现在 user 条目必须有
+  `<message msg_id="…">` 前缀才算真实聊天消息（真实用户消息由宿主
+  `build_planner_user_prefix_from_session_message` 写前缀，合成条目没有）。
+- **触发未入队时旁白不回滚**：`proactive.trigger` 返回
+  `{"success": False}`（如「未找到已存在的聊天流」）时，刚发布的旁白会留在缓存里
+  （最长 `context_ttl_minutes`），可能被之后某轮**普通对话**的请求锚上并注入——
+  用户正在聊天，麦麦突然说「你看了眼…的电脑屏幕」。现在入队失败 / 抛异常都会
+  `discard` 掉该流的旁白。
+- **空 `narration_template` 静默关掉功能**：`"".format()` 不抛异常、返回空串，
+  旁白被当成空文本丢弃，与「占位符写坏会自动回退」的说明不符。现在空模板直接走内置默认文案。
+- **`[cateye]` 的 WebUI 说明仍是 v2.5.0 旧行为**：`enabled` 还写着「想念回复与
+  早安/晚安触发时…未连接则告诉 LLM『恋人的电脑没开』」，`vlm_task` 还写着
+  「降级为『电脑开着但没看清』」——这些行为在 v2.6.0 已不存在，照旧描述排查会误导。
+- `_confirm_missing_with_llm` 的 `computer_context` 参数已无来源（见上），
+  连带移除，避免留下"看起来还能传值、实际恒为空"的死参数。
+- `_publish_screen_narration` 的前置判空从 `try` 外移进 `try` 内，
+  与「任何异常都不外抛、绝不阻塞主动触发」的承诺一致。
+
+### 验证
+
+- 插件自带离线测试 **153 项通过**（原 126 项 + 新增 `test_screen_context.py` 27 项：
+  文案模板 / 空模板 / 坏模板回退、三种看屏幕结果各自的旁白（看清楚 / 电脑没开 / 没看清）、
+  自定义模板、留空模板 = 那种情况不注入、`peek_screen()` 返回 None 时完全不注入、
+  锚点选取（跳过插件块、自身旁白、合成 user 条目）、跨轮复用锚点、`msg_id` 重建后仍命中、
+  单通道失效与双通道清空、TTL 过期、未知流不注入、planner/replyer 分通道独立、
+  非恋人会话（群聊/其他私聊/会话未知）一律不注入、触发未入队时撤掉旁白、
+  无缓存时 Hook 安全空转）。`cateye_client` 的 6 项按 `peek_screen()` 重写并补状态断言。
+- 全天巡检仿真（测试区 `_work_mailove_v260/probe_v260.py`）：开关关闭时想念正常触发；
+  开关打开时想念被 `future_schedule` 挡住（旧行为）；一天内 10 次主动触发**全部**
+  取到屏幕旁白。
+- 独立子代理对抗性自检：确认宿主 `maisaka.replyer.before_model_request` 契约成立
+  （HookSpec + `allow_kwargs_mutation=True`，载荷含 `items`/`session_id`，
+  `modified_kwargs` 会被整体采用；**必须回传 `item_schema_version`**，插件
+  `{**kwargs, ...}` 已保留），旁白条目快照通过宿主 `deserialize_prompt_items` 全量校验。
+
+## [2.5.0] - 2026-09-21
+
+### 新增（Added）
+
+- **`[injection]` 配置节**（上下文注入）：
+  - `group_affection_enabled`（默认 **false**）：群聊是否也注入「恋人当前状态 / 好感度」；
+  - `group_recent_user_messages`（默认 **15**，1~200）：群聊注入的回看条数 X——
+    只有上下文最后 X 条用户消息的**发送者 QQ 号**里出现目标用户才注入。
+- **`sender_identity.py`：发送者身份缓存（判定只看 QQ 号）**。
+  宿主写进 planner 上下文的真实消息只有 `msg_id` 与显示名（`user="昵称"` /
+  `group_card="群名片"`），**没有 QQ 号**，而名字谁都能改（还会出现「某某的小号」
+  这种形近名）。因此新增入站 Hook `chat.receive.before_process`
+  （`mai_lover_sender_identity`，只记录不拦截）维护两份缓存：
+  「消息 ID → 发送者 QQ 号」（`SenderCache`，24h TTL / 4096 容量）与
+  「会话 ID → 是否群聊」（`SessionKindCache`）；planner 请求前用上下文条目里的
+  `msg_id` 反查发送者，**按 QQ 号判定**，昵称/群名片只用于注入文案展示。
+  机制与 `cateye_admin_identity` 同源。
+- 注入文案**标注用户**：「【麦麦对用户 小美（QQ 100000000）的好感度】档位 2（…）」——
+  好感度属于哪一位用户一目了然。群聊档再附一句「恋人语气只在与 TA 直接互动时使用」的限定；
+  **私聊档不加范围说明**（私聊会话本身已确定对象、上下文里没有第三方，多写只是白烧 token）。
+- 节假日服务改为**整年放假安排表**（含调休补班日）+ 磁盘缓存
+  （`holiday_cache.json`，3 天 TTL，主备两个数据源）。
+
+### 修复（Fixed）
+
+- **注入污染群聊**：`maisaka.planner.before_request` 的注入原本完全不看 `session_id`，
+  任何会话（含群聊）都会被塞进「【当前状态】…【对用户的好感度】档位 2（热恋阶段…）」，
+  文案又不带用户标识。线上日志（2026-09-20）实测 35 条注入 **全部落在群聊会话**，
+  模型推理里出现「it's in 热恋阶段 with the admin (好感度档位2)」——群聊回复被私聊
+  恋人设定带跑。现在：日期行全会话注入；恋人上下文默认**只注入目标用户私聊**；
+  群聊需显式开启且满足"最近 X 条用户消息的发送者 QQ 号里出现目标用户"才注入；
+  `stream_id` 未解析、会话类型未知、发送者反查不到时一律 fail-safe（只注入日期）。
+  主动发言回合的「回复目标约束」套用同一门控（原先同样不分会话）。
+- **节假日判断实际从未生效**：旧代码取 `data["holiday"]["type"]`，而 timor.tech 把类型
+  放在 `data["type"]["type"]`（0=工作日 1=周末 2=节日 3=调休），`holiday` 里没有 `type` 键
+  → 恒为 `-1` → 每次都退回"按星期几判断"。表现为**国庆节显示"工作日"、
+  调休补班的周日显示"周末休息日"**（线上 2026-09-20 正是中秋前补班的周日）。
+  现在改为整年表 + 按天 API 层级修正 + 本地兜底三级降级，并正确处理 `type == 3`（调休）。
+
+### 变更（Changed）
+
+- `HolidayService.__init__` 新增可选参数 `data_dir`（提供时启用整年表磁盘缓存）；
+  新增 `refresh(year)` / `table_size(year)`。
+- `plugin.py` 的 `_resolve_stream_id` 顺带缓存目标用户的昵称/群名片
+  （`_remember_stream_identity`，**仅用于文案展示**），并兼容
+  `chat.get_stream_by_user_id` 的两种返回形状与 `get_private_streams` 的三种形状；
+  新增 `_stream_payload` / `_iter_stream_candidates` 辅助。
+- 新增私聊兜底：若 `session_id` 与缓存的私聊 `stream_id` 不一致、但该会话已知是私聊
+  且最近一条用户消息的发送者 QQ 就是目标用户（宿主重建会话的场景），仍按目标私聊注入。
+- `on_unload` 额外清空发送者/会话类型缓存。
+- `/mai_config` 与 `mai_lover_config` Tool 的摘要新增「恋人上下文注入」作用范围。
+- 文本变化：节假日文案改为 `国庆节假期` / `调休工作日（中秋节前补班）`
+  （原为 `{name}假期`，且调休日错误地落到本地星期几判断）。
+
+### 兼容性说明
+
+- **默认行为变化（重要）**：群聊不再注入「当前状态 / 好感度」——这正是本次修复的目的。
+  升级后群聊里只保留【当前日期】。需要旧行为请在 WebUI「上下文注入」里打开
+  「群聊也注入恋人上下文」（并注意它是"最近 X 条里出现 TA 才注入"，不是无条件注入）。
+- **无破坏性配置变更**：`config.toml` 只新增 `[injection]` 两个字段，旧字段与旧值全部保留。
+- **新增 Hook**：`chat.receive.before_process`（只记录「消息 ID → 发送者 QQ 号」与
+  「会话 ID → 是否群聊」，不做任何拦截与改写）。群聊注入判定与文案里的
+  "当前是群聊"都依赖它；插件启动前就在上下文里的历史消息因此不参与判定。
+- `config_version` 与 manifest 版本同步：**2.4.3 → 2.5.0**。
+- 许可证不变（MIT），上游版权声明原样保留。
+
 ## [2.4.3] - 2026-09-20
 
 ### 新增（Added）

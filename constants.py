@@ -72,6 +72,21 @@ SCREEN_DESCRIBE_PROMPT_DEFAULT: str = (
     "如果截图上看不出具体内容，就回答：屏幕上看不出具体内容。"
 )
 
+# 4) 屏幕旁白文案模板（v2.6.0，可在配置 [cateye] 中修改）
+#    占位符：{date} 年月日 / {time} 时分 / {user_name} 恋人显示名 / {description} 视觉转述
+#    成功：看清楚了 TA 在干什么
+SCREEN_NARRATION_TEMPLATE_DEFAULT: str = (
+    "现在是{date} {time}，你看了眼{user_name}的电脑屏幕，TA正在：{description}"
+)
+#    电脑没开（cateye 客户端未连接 / hub 未安装）：沿用 v2.5.0 的「电脑没开」语义
+SCREEN_OFFLINE_NARRATION_TEMPLATE_DEFAULT: str = (
+    "现在是{date} {time}，你想看一眼{user_name}的电脑屏幕，但TA的电脑没开"
+)
+#    看不成（截图失败 / 视觉理解失败）：沿用 v2.5.0 的「没看清」语义
+SCREEN_FAILED_NARRATION_TEMPLATE_DEFAULT: str = (
+    "现在是{date} {time}，你看了眼{user_name}的电脑屏幕，但没看清TA在干什么"
+)
+
 # 节假日 API 降级：周一~周五为工作日
 HOLIDAY_FALLBACK_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}
 

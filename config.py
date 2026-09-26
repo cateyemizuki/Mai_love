@@ -15,6 +15,9 @@ from .constants import (
     MISS_CONFIRM_PROMPT_DEFAULT,
     MISS_REASON_PROMPT_DEFAULT,
     SCREEN_DESCRIBE_PROMPT_DEFAULT,
+    SCREEN_FAILED_NARRATION_TEMPLATE_DEFAULT,
+    SCREEN_NARRATION_TEMPLATE_DEFAULT,
+    SCREEN_OFFLINE_NARRATION_TEMPLATE_DEFAULT,
 )
 
 
@@ -48,7 +51,7 @@ def _schema_i18n(
 # 插件总开关
 # ---------------------------------------------------------------------------
 
-CONFIG_SCHEMA_VERSION = "2.4.3"
+CONFIG_SCHEMA_VERSION = "2.6.0"
 
 
 class PluginConfig(PluginConfigBase):
@@ -534,6 +537,40 @@ class TimeWindowsConfig(PluginConfigBase):
             "order": 5,
         },
     )
+    miss_avoid_future_schedule: bool = Field(
+        default=False,
+        description="【仅对「想念」生效】开启后：未来一段时间内还有日程节点时，本轮不触发想念（「先不打扰」）。"
+                    "关闭（默认）= 不看日程，只要沉默够久就照常按概率触发。",
+        json_schema_extra={
+            "hint": "默认关闭。日程节点密集（尤其外部日程模式）时打开会让想念几乎永不触发——"
+                    "想验证想念机制请保持关闭。",
+            "i18n": _schema_i18n(
+                label_en="Miss Avoids Future Schedule",
+                label_ja="「会いたい」が今後の予定を避ける",
+                hint_en="When on, the miss trigger is skipped if a schedule node is coming up soon. "
+                        "Off by default; dense schedules can make 'missing you' effectively unreachable.",
+                hint_ja="オンにすると、直後に予定ノードがある場合は「会いたい」を発生させません。"
+                        "既定はオフ。予定が密だと「会いたい」が事実上発生しなくなります。",
+            ),
+            "label": "想念避开未来日程",
+            "order": 6,
+        },
+    )
+    miss_future_schedule_hours: float = Field(
+        default=2.0,
+        description="【仅对「想念」生效】「想念避开未来日程」的窗口长度（小时）：未来这么多小时内有日程节点就不打扰。",
+        json_schema_extra={
+            "hint": "小时，可填小数。仅在上面那个开关打开时生效。",
+            "i18n": _schema_i18n(
+                label_en="Miss Future Schedule Window (hours)",
+                label_ja="「会いたい」予定回避ウィンドウ（時間）",
+                hint_en="Only used when 'Miss Avoids Future Schedule' is on.",
+                hint_ja="上のスイッチがオンのときだけ有効です。",
+            ),
+            "label": "想念避开日程窗口（小时）",
+            "order": 7,
+        },
+    )
     miss_llm_check_enabled: bool = Field(
         default=True,
         description="想念触发前先让 LLM 以角色身份判断此刻主动说'想你了'是否自然，"
@@ -547,7 +584,7 @@ class TimeWindowsConfig(PluginConfigBase):
                 hint_ja="発話前に LLM が自然かどうかを判断します。却下された場合は 30 分後に再試行します。",
             ),
             "label": "想念触发前 LLM 把关",
-            "order": 6,
+            "order": 8,
         },
     )
     miss_reason_prompt: str = Field(
@@ -562,7 +599,7 @@ class TimeWindowsConfig(PluginConfigBase):
                 hint_ja="トリガー時に planner へ渡すテキスト。プレースホルダー: {lover_name}, {hours}。",
             ),
             "label": "想念触发提示词（触发后）",
-            "order": 7,
+            "order": 9,
             "rows": 3,
         },
     )
@@ -579,7 +616,7 @@ class TimeWindowsConfig(PluginConfigBase):
                 hint_ja="LLM が Y と答えたときのみ発火。プレースホルダー: {lover_name} など。",
             ),
             "label": "想念把关提示词（触发前）",
-            "order": 8,
+            "order": 10,
             "rows": 5,
         },
     )
@@ -592,6 +629,11 @@ class TimeWindowsConfig(PluginConfigBase):
     @classmethod
     def _normalize_miss_hours_max(cls, value: Any) -> float:
         return _normalize_float_in_range(value, 8.0, 0.5, 72.0)
+
+    @field_validator("miss_future_schedule_hours", mode="before")
+    @classmethod
+    def _normalize_future_schedule_hours(cls, value: Any) -> float:
+        return _normalize_float_in_range(value, 2.0, 0.0, 72.0)
 
     silence_start: str = Field(
         default="00:00",
@@ -607,7 +649,7 @@ class TimeWindowsConfig(PluginConfigBase):
                 placeholder_ja="00:00",
             ),
             "label": "静默开始时间",
-            "order": 5,
+            "order": 11,
             "placeholder": "00:00",
         },
     )
@@ -625,7 +667,7 @@ class TimeWindowsConfig(PluginConfigBase):
                 placeholder_ja="08:00",
             ),
             "label": "静默结束时间",
-            "order": 6,
+            "order": 12,
             "placeholder": "08:00",
         },
     )
@@ -678,15 +720,17 @@ class CateyeConfig(PluginConfigBase):
 
     enabled: bool = Field(
         default=False,
-        description="开启后，想念回复与早安/晚安触发时会通过 cateye 插件查看恋人电脑："
-                    "已连接则截图并用视觉模型转成一句话描述拼进提示词；未连接则告诉 LLM"
-                    "「恋人的电脑没开」。需要同时安装 cateye.connect-hub 插件且客户端在线。",
+        description="开启后，每次主动找你说话前（早安/晚安/想念/日程节点/日常巡检）都会通过 cateye "
+                    "插件看一眼恋人电脑：已连接则截图 + 视觉模型转述，作为旁白写进麦麦的上下文，"
+                    "再决定说什么；未连接则注入「电脑没开」、截图/理解失败则注入「没看清」"
+                    "（文案可改、留空则不注入）。需要同时安装 cateye.connect-hub 插件且客户端在线。",
         json_schema_extra={
             "hint": "默认关闭。开启前请确认已安装「cateye 统一连接插件」并在用户电脑上跑起客户端。",
             "i18n": _schema_i18n(
                 label_en="Cateye Integration",
                 label_ja="cateye 連携",
-                hint_en="On miss/morning/night triggers, peek at the lover's PC via the cateye hub plugin.",
+                hint_en="On every proactive trigger, peek at the lover's PC via the cateye hub plugin and "
+                        "write the description into MaiMai's context as a narration line.",
                 hint_ja="発話時に cateye 経由で恋人の PC 状態を確認します。",
             ),
             "label": "启用恋人电脑联动",
@@ -712,7 +756,7 @@ class CateyeConfig(PluginConfigBase):
         default="vlm",
         description="截图理解使用的视觉模型任务名（主程序 model_config.toml 的任务键，默认 vlm）。",
         json_schema_extra={
-            "hint": "宿主不支持图片输入时截图描述自动降级为「电脑开着但没看清」。",
+            "hint": "宿主不支持图片输入（视觉理解失败）时本轮不注入屏幕感知，其余触发逻辑不受影响。",
             "i18n": _schema_i18n(
                 label_en="Vision Task Name",
                 label_ja="視覚タスク名",
@@ -754,11 +798,88 @@ class CateyeConfig(PluginConfigBase):
             "rows": 4,
         },
     )
+    narration_template: str = Field(
+        default=SCREEN_NARRATION_TEMPLATE_DEFAULT,
+        description="屏幕转述写进上下文的文案模板。可用占位符：{date} 年月日、{time} 时分、"
+                    "{user_name} 恋人显示名、{description} 视觉模型转述。",
+        json_schema_extra={
+            "hint": "改这里可以调整旁白的语气与关注点；占位符写坏时自动回退到内置默认文案。",
+            "i18n": _schema_i18n(
+                label_en="Screen Narration Template",
+                label_ja="画面ナレーションのテンプレート",
+                hint_en="Template of the context line. Placeholders: {date}, {time}, {user_name}, {description}.",
+                hint_ja="コンテキストに書き込む文のテンプレート。プレースホルダー: {date}, {time}, {user_name}, {description}。",
+            ),
+            "label": "屏幕旁白文案模板",
+            "order": 5,
+            "rows": 3,
+        },
+    )
+    context_ttl_minutes: int = Field(
+        default=90,
+        ge=0,
+        le=1440,
+        description="屏幕旁白在上下文里的存活上限（分钟）：超过就丢弃，不再往 planner/replyer 注入。"
+                    "填 0 = 不限时（只在锚点消息滑出上下文时失效）。",
+        json_schema_extra={
+            "hint": "默认 90 分钟。设太大可能出现「几小时前看到 TA 在写代码」被当成现在的事。",
+            "i18n": _schema_i18n(
+                label_en="Screen Context TTL (minutes)",
+                label_ja="画面コンテキストの生存時間（分）",
+                hint_en="How long the narration stays injectable. 0 = no time limit (only until the anchor scrolls out).",
+                hint_ja="ナレーションを注入し続ける上限時間。0 = 無制限。",
+            ),
+            "label": "屏幕旁白存活上限（分钟）",
+            "order": 6,
+        },
+    )
+    offline_narration_template: str = Field(
+        default=SCREEN_OFFLINE_NARRATION_TEMPLATE_DEFAULT,
+        description="恋人电脑没开（客户端未连接 / cateye 插件不可用）时注入的旁白文案。"
+                    "可用占位符：{date} {time} {user_name}。**留空 = 这种情况不注入**。",
+        json_schema_extra={
+            "hint": "沿用 v2.5.0「恋人的电脑没开」的语义，但改为走旁白（不再拼进 planner 提示词）。"
+                    "不想让麦麦知道电脑没开就清空这一项。",
+            "i18n": _schema_i18n(
+                label_en="PC Offline Narration",
+                label_ja="PC オフ時のナレーション",
+                hint_en="Narration used when the lover's PC is offline. Placeholders: {date}, {time}, {user_name}. "
+                        "Leave blank to inject nothing in this case.",
+                hint_ja="相手の PC がオフのときのナレーション。プレースホルダー: {date}, {time}, {user_name}。空欄なら注入しません。",
+            ),
+            "label": "电脑没开时的旁白",
+            "order": 7,
+            "rows": 2,
+        },
+    )
+    failed_narration_template: str = Field(
+        default=SCREEN_FAILED_NARRATION_TEMPLATE_DEFAULT,
+        description="截图失败 / 视觉理解失败（看不成）时注入的旁白文案。"
+                    "可用占位符：{date} {time} {user_name}。**留空 = 这种情况不注入**。",
+        json_schema_extra={
+            "hint": "沿用 v2.5.0「没看清TA在干什么」的语义。整体超时仍按不注入处理（与 v2.5.0 一致）。",
+            "i18n": _schema_i18n(
+                label_en="Screenshot Failed Narration",
+                label_ja="スクリーンショット失敗時のナレーション",
+                hint_en="Narration used when the screenshot or vision call fails. Placeholders: {date}, {time}, {user_name}. "
+                        "Leave blank to inject nothing in this case.",
+                hint_ja="スクリーンショット／視覚解析に失敗したときのナレーション。空欄なら注入しません。",
+            ),
+            "label": "没看清时的旁白",
+            "order": 8,
+            "rows": 2,
+        },
+    )
 
     @field_validator("screenshot_blur", mode="before")
     @classmethod
     def _normalize_blur(cls, value: Any) -> int:
         return _normalize_int_in_range(value, 0, 0, 64)
+
+    @field_validator("context_ttl_minutes", mode="before")
+    @classmethod
+    def _normalize_context_ttl(cls, value: Any) -> int:
+        return _normalize_int_in_range(value, 90, 0, 1440)
 
 
 # ---------------------------------------------------------------------------
@@ -880,13 +1001,77 @@ class ProactiveLogConfig(PluginConfigBase):
 
 
 # ---------------------------------------------------------------------------
+# 上下文注入作用范围
+# ---------------------------------------------------------------------------
+
+
+class InjectionConfig(PluginConfigBase):
+    """控制恋人上下文（当前状态 / 好感度）注入到哪些会话（v2.5.0）。
+
+    默认**只在目标用户私聊里注入**：群聊里注入「麦麦对用户的好感度」这类
+    私聊恋人设定，会让 bot 把恋人语气用到所有人身上（实测会让它在群里
+    只围着恋人转、不理其他人）。
+
+    判定**只看 QQ 号**：昵称与群名片任何人都能改（也会出现"某某的小号"这种
+    形近名），所以插件在入站链路上记「消息 ID → 发送者 QQ 号」，
+    请求前用上下文里的 msg_id 反查；反查不到时不注入（宁可漏、不误判）。
+    """
+
+    __ui_label__: ClassVar[str] = "上下文注入"
+    __ui_order__: ClassVar[int] = 9
+
+    group_affection_enabled: bool = Field(
+        default=False,
+        description="群聊里是否也注入「恋人当前状态 / 好感度」上下文。默认关闭（只在目标用户的私聊里注入）。"
+                    "即使打开，也只在群聊、且最近若干条用户消息里出现目标用户的 QQ 号 时才注入。"
+                    "【当前日期】这类中性信息不受本开关影响，始终注入。",
+        json_schema_extra={
+            "hint": "默认关闭。打开后仅当恋人最近在群里说过话才注入，避免 bot 在群里忽略其他人。",
+            "i18n": _schema_i18n(
+                label_en="Inject lover context in group chats",
+                label_ja="グループでも恋人コンテキストを注入",
+                hint_en="Off by default (private chat only). When on, the lover context is injected into group chats "
+                        "only if the lover (matched by QQ id) appears in the recent messages.",
+                hint_ja="既定はオフ（個人チャットのみ）。オンにすると、最近のメッセージに恋人（QQ 番号で判定）が"
+                        "現れた場合のみグループにも注入します。",
+            ),
+            "label": "群聊也注入恋人上下文",
+            "order": 0,
+        },
+    )
+    group_recent_user_messages: int = Field(
+        default=15,
+        ge=1,
+        le=200,
+        description="群聊注入的回看条数 X：只有上下文最后 X 条用户消息里出现过目标用户的 QQ 号才会注入"
+                    "（条数按用户消息计，不被系统/助手条目稀释）。数值越大越宽松，越小越严格。",
+        json_schema_extra={
+            "hint": "默认 15 条。恋人刚说过话才注入，避免刷屏式地一直在意恋人。",
+            "i18n": _schema_i18n(
+                label_en="Group lookback (user messages)",
+                label_ja="グループ遡り件数（ユーザー発言）",
+                hint_en="Look back this many user messages for the lover's QQ id; only then inject in group chats. Default 15.",
+                hint_ja="直近この件数のユーザー発言に恋人（QQ 番号）がいればグループにも注入します。既定 15。",
+            ),
+            "label": "群聊回看条数",
+            "order": 1,
+        },
+    )
+
+    @field_validator("group_recent_user_messages", mode="before")
+    @classmethod
+    def _normalize_group_recent(cls, value: Any) -> int:
+        return _normalize_int_in_range(value, 15, 1, 200)
+
+
+# ---------------------------------------------------------------------------
 # 顶层配置聚合
 # ---------------------------------------------------------------------------
 
 
 class MaiLoverPluginSettings(PluginConfigBase):
     """麦麦恋人插件完整配置。包含开关、白名单、调度、概率、时间窗、好感度、
-    恋人电脑联动、LLM 日志、主动行为日志九大模块。"""
+    恋人电脑联动、LLM 日志、主动行为日志、上下文注入十大模块。"""
 
     plugin: PluginConfig = Field(default_factory=PluginConfig)
     whitelist: WhitelistConfig = Field(default_factory=WhitelistConfig)
@@ -897,6 +1082,7 @@ class MaiLoverPluginSettings(PluginConfigBase):
     cateye: CateyeConfig = Field(default_factory=CateyeConfig)
     llm_log: LLMLogConfig = Field(default_factory=LLMLogConfig)
     proactive_log: ProactiveLogConfig = Field(default_factory=ProactiveLogConfig)
+    injection: InjectionConfig = Field(default_factory=InjectionConfig)
 
 
 # ---------------------------------------------------------------------------

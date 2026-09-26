@@ -22,6 +22,8 @@ data/
 affection_memory.json
 schedule_cache.json
 schedule_cache.json.bak
+holiday_cache.json
+holiday_cache.json.tmp
 .schedule_generated
 llm_logs/
 proactive_logs/
